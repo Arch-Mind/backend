@@ -1,0 +1,82 @@
+# IDE and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Dependencies
+node_modules/
+vendor/
+target/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Build Outputs
+dist/
+build/
+out/
+.next/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go
+go.work
+go.work.sum
+
+# Rust
+Cargo.lock
+debug/
+target/
+
+# Python
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+pgdata/
+neo4j-data/
+
+# Docker
+docker-compose.override.yml
+
+# Temporary Files
+tmp/
+temp/
+*.tmp
+.cache/
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes

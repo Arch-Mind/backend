@@ -1,0 +1,72 @@
+{
+  "name": "archmind-vscode",
+  "displayName": "ArchMind - Code Intelligence",
+  "description": "Real-time codebase intelligence and architecture visualization in VS Code",
+  "version": "0.1.0",
+  "publisher": "archmind",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "archmind.analyzeWorkspace",
+        "title": "ArchMind: Analyze Workspace"
+      },
+      {
+        "command": "archmind.showDependencyGraph",
+        "title": "ArchMind: Show Dependency Graph"
+      },
+      {
+        "command": "archmind.impactAnalysis",
+        "title": "ArchMind: Impact Analysis"
+      }
+    ],
+    "configuration": {
+      "title": "ArchMind",
+      "properties": {
+        "archmind.apiGatewayUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "API Gateway URL"
+        },
+        "archmind.graphEngineUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "Graph Engine URL"
+        },
+        "archmind.autoAnalyze": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically analyze workspace on open"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.5"
+  }
+}

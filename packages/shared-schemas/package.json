@@ -1,0 +1,17 @@
+{
+  "name": "@archmind/shared-schemas",
+  "version": "0.1.0",
+  "description": "Shared TypeScript types and JSON schemas for ArchMind platform",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "keywords": ["archmind", "schemas", "types"],
+  "author": "ArchMind Team",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
