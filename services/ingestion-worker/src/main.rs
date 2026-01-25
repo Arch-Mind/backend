@@ -1,8 +1,13 @@
+mod parsers;
+
 use anyhow::{Context, Result};
+use parsers::{javascript::JavaScriptParser, typescript::TypeScriptParser, LanguageParser, ParsedFile};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -149,7 +154,7 @@ async fn analyze_repository(job: &AnalysisJob, neo4j_graph: &neo4rs::Graph) -> R
     Ok(())
 }
 
-fn clone_repository(repo_url: &str, branch: &str) -> Result<std::path::PathBuf> {
+fn clone_repository(_repo_url: &str, _branch: &str) -> Result<std::path::PathBuf> {
     // For now, return a mock path
     // In production, use git2 to clone:
     // let repo = git2::Repository::clone(repo_url, &tmp_path)?;
@@ -160,37 +165,121 @@ fn clone_repository(repo_url: &str, branch: &str) -> Result<std::path::PathBuf> 
 }
 
 fn parse_repository(repo_path: &std::path::PathBuf) -> Result<Vec<ParsedFile>> {
-    // Mock implementation
-    // In production:
-    // 1. Walk directory tree
-    // 2. Identify file types by extension
-    // 3. Use appropriate tree-sitter parser
-    // 4. Extract AST nodes (functions, classes, imports)
+    let mut parsed_files = Vec::new();
     
-    warn!("⚠️  Repository parsing not yet implemented (mock)");
-    Ok(vec![ParsedFile {
-        path: "src/main.rs".to_string(),
-        language: "rust".to_string(),
-        functions: vec!["main".to_string(), "process_job".to_string()],
-        classes: vec![],
-        imports: vec!["tokio".to_string(), "redis".to_string()],
-    }])
+    // Initialize parsers
+    let js_parser = JavaScriptParser::new()?;
+    let ts_parser = TypeScriptParser::new()?;
+    
+    // Walk directory tree
+    walk_directory(repo_path, &mut parsed_files, &js_parser, &ts_parser)?;
+    
+    info!("📄 Successfully parsed {} files", parsed_files.len());
+    Ok(parsed_files)
+}
+
+fn walk_directory(
+    dir: &PathBuf,
+    parsed_files: &mut Vec<ParsedFile>,
+    js_parser: &JavaScriptParser,
+    ts_parser: &TypeScriptParser,
+) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    
+    for entry in fs::read_dir(dir).context("Failed to read directory")? {
+        let entry = entry.context("Failed to read directory entry")?;
+        let path = entry.path();
+        
+        // Skip hidden directories and common ignore patterns
+        if let Some(name) = path.file_name() {
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') 
+                || name_str == "node_modules"
+                || name_str == "target"
+                || name_str == "dist"
+                || name_str == "build" {
+                continue;
+            }
+        }
+        
+        if path.is_dir() {
+            // Recursively walk subdirectories
+            walk_directory(&path, parsed_files, js_parser, ts_parser)?;
+        } else if path.is_file() {
+            // Parse files based on extension
+            if let Some(extension) = path.extension() {
+                let ext = extension.to_string_lossy().to_lowercase();
+                let content = fs::read_to_string(&path)
+                    .context(format!("Failed to read file: {:?}", path))?;
+                
+                let parsed = match ext.as_str() {
+                    "js" | "jsx" | "mjs" => {
+                        js_parser.parse_file(&path, &content).ok()
+                    }
+                    "ts" | "tsx" => {
+                        ts_parser.parse_file(&path, &content).ok()
+                    }
+                    _ => None,
+                };
+                
+                if let Some(parsed_file) = parsed {
+                    info!("✓ Parsed: {:?} ({} functions, {} imports)", 
+                          path, 
+                          parsed_file.functions.len(),
+                          parsed_file.imports.len());
+                    parsed_files.push(parsed_file);
+                }
+            }
+        }
+    }
+    
+    Ok(())
 }
 
 fn extract_dependencies(parsed_files: &[ParsedFile]) -> Result<Vec<Dependency>> {
-    // Mock implementation
-    // In production:
-    // 1. Analyze imports across files
-    // 2. Detect function calls
-    // 3. Identify class inheritance
-    // 4. Map relationships
+    let mut dependencies = Vec::new();
     
-    warn!("⚠️  Dependency extraction not yet implemented (mock)");
-    Ok(vec![Dependency {
-        from: "main".to_string(),
-        to: "process_job".to_string(),
-        relationship_type: "CALLS".to_string(),
-    }])
+    // Build a map of all functions defined in the codebase
+    let mut defined_functions: HashMap<String, String> = HashMap::new();
+    for file in parsed_files {
+        for func in &file.functions {
+            defined_functions.insert(func.name.clone(), file.path.clone());
+        }
+    }
+    
+    // Extract dependencies from function calls
+    for file in parsed_files {
+        for func in &file.functions {
+            for call in &func.calls {
+                // Check if this call is to a function defined in our codebase
+                if let Some(target_file) = defined_functions.get(call) {
+                    dependencies.push(Dependency {
+                        from: format!("{}::{}", file.path, func.name),
+                        to: format!("{}::{}", target_file, call),
+                        relationship_type: "CALLS".to_string(),
+                        source_file: file.path.clone(),
+                        target_file: target_file.clone(),
+                    });
+                }
+            }
+        }
+        
+        // Add import dependencies
+        for import in &file.imports {
+            dependencies.push(Dependency {
+                from: file.path.clone(),
+                to: import.clone(),
+                relationship_type: "IMPORTS".to_string(),
+                source_file: file.path.clone(),
+                target_file: import.clone(),
+            });
+        }
+    }
+    
+    info!("🔗 Extracted {} dependencies", dependencies.len());
+    Ok(dependencies)
 }
 
 async fn store_in_neo4j(
@@ -199,35 +288,92 @@ async fn store_in_neo4j(
     parsed_files: &[ParsedFile],
     dependencies: &[Dependency],
 ) -> Result<()> {
-    // Mock implementation
-    // In production:
-    // 1. Create nodes for files, functions, classes
-    // 2. Create relationships (CALLS, IMPORTS, INHERITS)
-    // 3. Add job metadata
+    info!("💾 Storing graph data in Neo4j...");
     
-    warn!("⚠️  Neo4j storage not yet implemented (mock)");
+    // Create job node
+    let job_query = neo4rs::query(
+        "CREATE (j:Job {id: $id, status: 'COMPLETED', timestamp: datetime()})"
+    )
+    .param("id", job_id);
+    graph.run(job_query).await.context("Failed to create job node")?;
     
-    // Example: Create a simple node
-    let query = neo4rs::query("CREATE (j:Job {id: $id, status: 'COMPLETED'})").param("id", job_id);
-    graph.run(query).await.context("Failed to create job node")?;
+    // Create file nodes and function nodes
+    for file in parsed_files {
+        // Create file node
+        let file_query = neo4rs::query(
+            "MERGE (f:File {path: $path}) 
+             SET f.language = $language, 
+                 f.job_id = $job_id"
+        )
+        .param("path", file.path.clone())
+        .param("language", file.language.clone())
+        .param("job_id", job_id);
+        graph.run(file_query).await.context("Failed to create file node")?;
+        
+        // Create function nodes
+        for func in &file.functions {
+            let func_query = neo4rs::query(
+                "MERGE (fn:Function {name: $name, file: $file})
+                 SET fn.start_line = $start_line,
+                     fn.end_line = $end_line,
+                     fn.job_id = $job_id"
+            )
+            .param("name", func.name.clone())
+            .param("file", file.path.clone())
+            .param("start_line", func.start_line as i64)
+            .param("end_line", func.end_line as i64)
+            .param("job_id", job_id);
+            graph.run(func_query).await.context("Failed to create function node")?;
+            
+            // Link function to file
+            let link_query = neo4rs::query(
+                "MATCH (f:File {path: $file}), (fn:Function {name: $func_name, file: $file})
+                 MERGE (f)-[:DEFINES]->(fn)"
+            )
+            .param("file", file.path.clone())
+            .param("func_name", func.name.clone());
+            graph.run(link_query).await.context("Failed to link function to file")?;
+        }
+    }
     
-    info!("Created job node in Neo4j: {}", job_id);
+    // Create dependency relationships
+    for dep in dependencies {
+        if dep.relationship_type == "CALLS" {
+            let dep_query = neo4rs::query(
+                "MATCH (from:Function {name: $from})
+                 MATCH (to:Function {name: $to})
+                 WHERE from.file = $source_file AND to.file = $target_file
+                 MERGE (from)-[:CALLS]->(to)"
+            )
+            .param("from", dep.from.split("::").last().unwrap_or(&dep.from))
+            .param("to", dep.to.split("::").last().unwrap_or(&dep.to))
+            .param("source_file", dep.source_file.clone())
+            .param("target_file", dep.target_file.clone());
+            graph.run(dep_query).await.ok(); // Ignore errors for cross-file calls
+        } else if dep.relationship_type == "IMPORTS" {
+            let import_query = neo4rs::query(
+                "MATCH (f:File {path: $file})
+                 MERGE (m:Module {name: $module})
+                 MERGE (f)-[:IMPORTS]->(m)"
+            )
+            .param("file", dep.source_file.clone())
+            .param("module", dep.to.clone());
+            graph.run(import_query).await.ok(); // Ignore errors
+        }
+    }
+    
+    info!("✅ Successfully stored {} files and {} dependencies in Neo4j", 
+          parsed_files.len(), 
+          dependencies.len());
     Ok(())
 }
 
 // Helper structs
 #[derive(Debug, Clone)]
-struct ParsedFile {
-    path: String,
-    language: String,
-    functions: Vec<String>,
-    classes: Vec<String>,
-    imports: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
 struct Dependency {
     from: String,
     to: String,
     relationship_type: String,
+    source_file: String,
+    target_file: String,
 }
