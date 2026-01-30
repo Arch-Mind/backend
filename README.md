@@ -1,4 +1,4 @@
-# ArchMind - Backend Code Analysis & Dependency Graph Platform
+# ArchMind - Backend: Code Analysis & Dependency Graph Platform
 
 > A polyglot backend platform for parsing JavaScript/TypeScript source code, building dependency graphs, and enabling real-time architecture analysis.
 
