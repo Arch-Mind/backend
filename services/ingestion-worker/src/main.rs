@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
-use tracing::{error, info, warn};
+use std::path::{Path, PathBuf};
+use tracing::{error, info};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AnalysisJob {
@@ -130,15 +130,45 @@ async fn process_job(
     }
 }
 
+use git2::{Cred, FetchOptions, RemoteCallbacks};
+use std::ops::Deref;
+use uuid::Uuid;
+
+struct TempRepo {
+    path: PathBuf,
+}
+
+impl Drop for TempRepo {
+    fn drop(&mut self) {
+        info!("🧹 Cleaning up temporary repository: {:?}", self.path);
+        if let Err(e) = fs::remove_dir_all(&self.path) {
+            error!("❌ Failed to cleanup temporary directory {:?}: {:?}", self.path, e);
+        }
+    }
+}
+
+impl AsRef<Path> for TempRepo {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Deref for TempRepo {
+    type Target = PathBuf;
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
 async fn analyze_repository(job: &AnalysisJob, neo4j_graph: &neo4rs::Graph) -> Result<()> {
     info!("🔍 Analyzing repository: {}", job.repo_url);
 
     // Step 1: Clone repository
-    let repo_path = clone_repository(&job.repo_url, &job.branch)?;
-    info!("📦 Repository cloned to: {:?}", repo_path);
+    let temp_repo = clone_repository(&job.repo_url, &job.branch, &job.options)?;
+    info!("📦 Repository cloned to: {:?}", temp_repo.path);
 
     // Step 2: Parse source files with tree-sitter
-    let parsed_files = parse_repository(&repo_path)?;
+    let parsed_files = parse_repository(&temp_repo.path)?;
     info!("📄 Parsed {} files", parsed_files.len());
 
     // Step 3: Extract dependencies and relationships
@@ -154,14 +184,66 @@ async fn analyze_repository(job: &AnalysisJob, neo4j_graph: &neo4rs::Graph) -> R
     Ok(())
 }
 
-fn clone_repository(_repo_url: &str, _branch: &str) -> Result<std::path::PathBuf> {
-    // For now, return a mock path
-    // In production, use git2 to clone:
-    // let repo = git2::Repository::clone(repo_url, &tmp_path)?;
-    // repo.set_head(&format!("refs/heads/{}", branch))?;
+fn clone_repository(
+    repo_url: &str, 
+    branch: &str,
+    options: &Option<HashMap<String, String>>
+) -> Result<TempRepo> {
+    // Generate unique temporary directory
+    let tmp_dir = env::temp_dir().join(format!("archmind-repo-{}", Uuid::new_v4()));
+    info!("🚀 Cloning {} (branch: {}) to {:?}", repo_url, branch, tmp_dir);
+
+    // Prepare callbacks for authentication
+    let mut callbacks = RemoteCallbacks::new();
     
-    warn!("⚠️  Repository cloning not yet implemented (mock)");
-    Ok(std::path::PathBuf::from("/tmp/mock-repo"))
+    // Check for git token in options
+    if let Some(opts) = options {
+        if let Some(token) = opts.get("git_token") {
+            callbacks.credentials(move |_url, _username_from_url, _allowed_types| {
+                Cred::userpass_plaintext("x-access-token", token)
+            });
+        }
+    }
+
+    let mut fetch_options = FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options(fetch_options);
+
+    // Clone the repository
+    let repo = builder.clone(repo_url, &tmp_dir)
+        .context("Failed to clone repository")?;
+
+    // Checkout specific branch if not default
+    let head = repo.head().context("Failed to get HEAD")?;
+    let head_name = head.shorthand().unwrap_or("master");
+
+    if head_name != branch {
+        info!("🔀 Switching to branch: {}", branch);
+        
+        let (object, reference) = repo.revparse_ext(branch).or_else(|_| {
+            // Try looking for remote branch
+            repo.revparse_ext(&format!("origin/{}", branch))
+        }).context(format!("Branch '{}' not found", branch))?;
+
+        repo.checkout_tree(&object, None)
+            .context("Failed to checkout branch tree")?;
+
+        match reference {
+            Some(gref) => {
+                repo.set_head(gref.name().unwrap())
+                    .context("Failed to set HEAD")?;
+            }
+            None => {
+                // If it's a commit hash or tag without ref
+                repo.set_head_detached(object.id())
+                     .context("Failed to set HEAD detached")?;
+            }
+        }
+    }
+
+    Ok(TempRepo { path: tmp_dir })
 }
 
 fn parse_repository(repo_path: &std::path::PathBuf) -> Result<Vec<ParsedFile>> {
