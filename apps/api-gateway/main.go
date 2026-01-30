@@ -2,12 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -17,6 +23,97 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
+
+// =============================================================================
+// GitHub Webhook Types
+// =============================================================================
+
+// GitHubPushPayload represents the payload from a GitHub push event
+type GitHubPushPayload struct {
+	Ref        string              `json:"ref"`
+	Before     string              `json:"before"`
+	After      string              `json:"after"`
+	Repository GitHubRepository    `json:"repository"`
+	Pusher     GitHubPusher        `json:"pusher"`
+	Commits    []GitHubCommit      `json:"commits"`
+	HeadCommit *GitHubCommit       `json:"head_commit"`
+}
+
+// GitHubPullRequestPayload represents the payload from a GitHub pull_request event
+type GitHubPullRequestPayload struct {
+	Action      string            `json:"action"`
+	Number      int               `json:"number"`
+	PullRequest GitHubPullRequest `json:"pull_request"`
+	Repository  GitHubRepository  `json:"repository"`
+}
+
+// GitHubRepository represents repository information in webhook payloads
+type GitHubRepository struct {
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	FullName string `json:"full_name"`
+	CloneURL string `json:"clone_url"`
+	HTMLURL  string `json:"html_url"`
+	Private  bool   `json:"private"`
+	Owner    struct {
+		Login string `json:"login"`
+	} `json:"owner"`
+	DefaultBranch string `json:"default_branch"`
+}
+
+// GitHubPusher represents the user who pushed the code
+type GitHubPusher struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+// GitHubCommit represents a commit in the push payload
+type GitHubCommit struct {
+	ID        string   `json:"id"`
+	Message   string   `json:"message"`
+	Timestamp string   `json:"timestamp"`
+	Author    struct {
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	} `json:"author"`
+	Added    []string `json:"added"`
+	Removed  []string `json:"removed"`
+	Modified []string `json:"modified"`
+}
+
+// GitHubPullRequest represents a pull request in the webhook payload
+type GitHubPullRequest struct {
+	ID     int64  `json:"id"`
+	Number int    `json:"number"`
+	State  string `json:"state"`
+	Title  string `json:"title"`
+	Head   struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+}
+
+// WebhookResponse represents the response sent back to GitHub
+type WebhookResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	JobID   string `json:"job_id,omitempty"`
+}
+
+// Supported file extensions for code analysis
+var analyzableExtensions = map[string]bool{
+	".ts":   true,
+	".tsx":  true,
+	".js":   true,
+	".jsx":  true,
+	".go":   true,
+	".rs":   true,
+	".py":   true,
+	".java": true,
+}
 
 // AnalyzeRequest represents the incoming request to analyze a repository
 type AnalyzeRequest struct {
@@ -120,6 +217,12 @@ func setupRouter() *gin.Engine {
 
 	// Health check
 	router.GET("/health", healthCheck)
+
+	// Webhooks (no auth required, uses signature verification)
+	webhooks := router.Group("/webhooks")
+	{
+		webhooks.POST("/github", handleGitHubWebhook)
+	}
 
 	// API routes
 	v1 := router.Group("/api/v1")
@@ -396,4 +499,290 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// =============================================================================
+// GitHub Webhook Handlers
+// =============================================================================
+
+// handleGitHubWebhook processes incoming GitHub webhook events
+// POST /webhooks/github
+func handleGitHubWebhook(c *gin.Context) {
+	// Step 1: Read the raw body for signature verification
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		log.Printf("❌ Webhook: Failed to read request body: %v", err)
+		c.JSON(http.StatusBadRequest, WebhookResponse{
+			Status:  "error",
+			Message: "Failed to read request body",
+		})
+		return
+	}
+
+	// Step 2: Verify the signature (security check)
+	signature := c.GetHeader("X-Hub-Signature-256")
+	if !verifyGitHubSignature(body, signature) {
+		log.Printf("❌ Webhook: Invalid signature from IP: %s", c.ClientIP())
+		c.JSON(http.StatusUnauthorized, WebhookResponse{
+			Status:  "error",
+			Message: "Invalid signature",
+		})
+		return
+	}
+
+	// Step 3: Check the event type
+	eventType := c.GetHeader("X-GitHub-Event")
+	deliveryID := c.GetHeader("X-GitHub-Delivery")
+	
+	log.Printf("📥 Webhook received: event=%s, delivery=%s", eventType, deliveryID)
+
+	// Step 4: Route to appropriate handler based on event type
+	switch eventType {
+	case "push":
+		handlePushEvent(c, body)
+	case "pull_request":
+		handlePullRequestEvent(c, body)
+	case "ping":
+		// GitHub sends a ping event when webhook is first configured
+		c.JSON(http.StatusOK, WebhookResponse{
+			Status:  "ok",
+			Message: "Pong! Webhook configured successfully",
+		})
+	default:
+		// Ignore other events but return 200 OK to acknowledge receipt
+		log.Printf("ℹ️ Webhook: Ignoring event type: %s", eventType)
+		c.JSON(http.StatusOK, WebhookResponse{
+			Status:  "ignored",
+			Message: fmt.Sprintf("Event type '%s' is not processed", eventType),
+		})
+	}
+}
+
+// verifyGitHubSignature validates the X-Hub-Signature-256 header
+// This ensures the request actually came from GitHub
+func verifyGitHubSignature(payload []byte, signature string) bool {
+	secret := getEnv("GITHUB_WEBHOOK_SECRET", "")
+	if secret == "" {
+		log.Println("⚠️ Warning: GITHUB_WEBHOOK_SECRET not set, skipping signature verification")
+		return true // Allow in development, but log warning
+	}
+
+	if signature == "" {
+		return false
+	}
+
+	// Signature format: "sha256=<hex-encoded-signature>"
+	if !strings.HasPrefix(signature, "sha256=") {
+		return false
+	}
+
+	expectedMAC := signature[7:] // Remove "sha256=" prefix
+
+	// Compute HMAC-SHA256
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	actualMAC := hex.EncodeToString(mac.Sum(nil))
+
+	// Constant-time comparison to prevent timing attacks
+	return hmac.Equal([]byte(expectedMAC), []byte(actualMAC))
+}
+
+// handlePushEvent processes GitHub push events
+func handlePushEvent(c *gin.Context, body []byte) {
+	var payload GitHubPushPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		log.Printf("❌ Webhook: Failed to parse push payload: %v", err)
+		c.JSON(http.StatusBadRequest, WebhookResponse{
+			Status:  "error",
+			Message: "Invalid push payload",
+		})
+		return
+	}
+
+	// Extract branch name from ref (refs/heads/main -> main)
+	branch := extractBranchName(payload.Ref)
+	
+	log.Printf("📤 Push event: repo=%s, branch=%s, commits=%d", 
+		payload.Repository.FullName, branch, len(payload.Commits))
+
+	// Check if any analyzable files were changed
+	changedFiles := collectChangedFiles(payload.Commits)
+	if !hasAnalyzableFiles(changedFiles) {
+		log.Printf("ℹ️ Webhook: No analyzable files changed, skipping analysis")
+		c.JSON(http.StatusOK, WebhookResponse{
+			Status:  "skipped",
+			Message: "No analyzable code files were changed",
+		})
+		return
+	}
+
+	// Create and queue analysis job
+	jobID, err := createWebhookAnalysisJob(payload.Repository.CloneURL, branch, "push", changedFiles)
+	if err != nil {
+		log.Printf("❌ Webhook: Failed to create analysis job: %v", err)
+		c.JSON(http.StatusInternalServerError, WebhookResponse{
+			Status:  "error",
+			Message: "Failed to create analysis job",
+		})
+		return
+	}
+
+	log.Printf("✅ Webhook: Created analysis job %s for push to %s/%s", 
+		jobID, payload.Repository.FullName, branch)
+
+	// Return 200 OK immediately (must be < 500ms for GitHub)
+	c.JSON(http.StatusOK, WebhookResponse{
+		Status:  "queued",
+		Message: "Analysis job created",
+		JobID:   jobID,
+	})
+}
+
+// handlePullRequestEvent processes GitHub pull request events
+func handlePullRequestEvent(c *gin.Context, body []byte) {
+	var payload GitHubPullRequestPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		log.Printf("❌ Webhook: Failed to parse pull_request payload: %v", err)
+		c.JSON(http.StatusBadRequest, WebhookResponse{
+			Status:  "error",
+			Message: "Invalid pull_request payload",
+		})
+		return
+	}
+
+	// Only process specific actions
+	validActions := map[string]bool{
+		"opened":      true,
+		"synchronize": true, // New commits pushed to PR
+		"reopened":    true,
+	}
+
+	if !validActions[payload.Action] {
+		log.Printf("ℹ️ Webhook: Ignoring pull_request action: %s", payload.Action)
+		c.JSON(http.StatusOK, WebhookResponse{
+			Status:  "ignored",
+			Message: fmt.Sprintf("Pull request action '%s' is not processed", payload.Action),
+		})
+		return
+	}
+
+	branch := payload.PullRequest.Head.Ref
+	
+	log.Printf("🔀 Pull request event: repo=%s, PR=#%d, action=%s, branch=%s",
+		payload.Repository.FullName, payload.Number, payload.Action, branch)
+
+	// Create and queue analysis job for the PR branch
+	jobID, err := createWebhookAnalysisJob(
+		payload.Repository.CloneURL, 
+		branch, 
+		"pull_request",
+		nil, // PR events don't include file changes, analyze everything
+	)
+	if err != nil {
+		log.Printf("❌ Webhook: Failed to create analysis job: %v", err)
+		c.JSON(http.StatusInternalServerError, WebhookResponse{
+			Status:  "error",
+			Message: "Failed to create analysis job",
+		})
+		return
+	}
+
+	log.Printf("✅ Webhook: Created analysis job %s for PR #%d on %s",
+		jobID, payload.Number, payload.Repository.FullName)
+
+	c.JSON(http.StatusOK, WebhookResponse{
+		Status:  "queued",
+		Message: fmt.Sprintf("Analysis job created for PR #%d", payload.Number),
+		JobID:   jobID,
+	})
+}
+
+// extractBranchName extracts the branch name from a git ref
+// e.g., "refs/heads/main" -> "main"
+func extractBranchName(ref string) string {
+	const prefix = "refs/heads/"
+	if strings.HasPrefix(ref, prefix) {
+		return strings.TrimPrefix(ref, prefix)
+	}
+	return ref
+}
+
+// collectChangedFiles aggregates all changed files from commits
+func collectChangedFiles(commits []GitHubCommit) []string {
+	fileSet := make(map[string]bool)
+	for _, commit := range commits {
+		for _, file := range commit.Added {
+			fileSet[file] = true
+		}
+		for _, file := range commit.Modified {
+			fileSet[file] = true
+		}
+		// We might also want to track removed files for cleanup
+	}
+
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
+	}
+	return files
+}
+
+// hasAnalyzableFiles checks if any of the changed files are code files we can analyze
+func hasAnalyzableFiles(files []string) bool {
+	for _, file := range files {
+		ext := strings.ToLower(filepath.Ext(file))
+		if analyzableExtensions[ext] {
+			return true
+		}
+	}
+	return false
+}
+
+// createWebhookAnalysisJob creates a new analysis job from a webhook event
+func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []string) (string, error) {
+	jobID := uuid.New().String()
+
+	// Build options with webhook metadata
+	options := map[string]string{
+		"trigger": trigger,
+		"source":  "webhook",
+	}
+	
+	if len(changedFiles) > 0 {
+		// Store changed files (truncate if too many)
+		maxFiles := 100
+		if len(changedFiles) > maxFiles {
+			changedFiles = changedFiles[:maxFiles]
+			options["files_truncated"] = "true"
+		}
+		filesJSON, _ := json.Marshal(changedFiles)
+		options["changed_files"] = string(filesJSON)
+	}
+
+	job := AnalysisJob{
+		JobID:     jobID,
+		RepoURL:   repoURL,
+		Branch:    branch,
+		Status:    "QUEUED",
+		Options:   options,
+		CreatedAt: time.Now().UTC(),
+	}
+
+	// Store job in PostgreSQL
+	if err := storeJob(job); err != nil {
+		return "", fmt.Errorf("failed to store job: %w", err)
+	}
+
+	// Serialize job to JSON
+	jobJSON, err := json.Marshal(job)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal job: %w", err)
+	}
+
+	// Push job to Redis queue (high priority for webhooks)
+	if err := redisClient.LPush(ctx, "analysis_queue", jobJSON).Err(); err != nil {
+		return "", fmt.Errorf("failed to queue job: %w", err)
+	}
+
+	return jobID, nil
 }
