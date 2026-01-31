@@ -1,7 +1,15 @@
 mod parsers;
 
 use anyhow::{Context, Result};
-use parsers::{javascript::JavaScriptParser, typescript::TypeScriptParser, LanguageParser, ParsedFile};
+use parsers::{
+    javascript::JavaScriptParser, 
+    typescript::TypeScriptParser, 
+    rust_parser::RustParser,
+    go_parser::GoParser,
+    python_parser::PythonParser,
+    LanguageParser, 
+    ParsedFile
+};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -252,9 +260,20 @@ fn parse_repository(repo_path: &std::path::PathBuf) -> Result<Vec<ParsedFile>> {
     // Initialize parsers
     let js_parser = JavaScriptParser::new()?;
     let ts_parser = TypeScriptParser::new()?;
+    let rust_parser = RustParser::new()?;
+    let go_parser = GoParser::new()?;
+    let py_parser = PythonParser::new()?;
     
     // Walk directory tree
-    walk_directory(repo_path, &mut parsed_files, &js_parser, &ts_parser)?;
+    walk_directory(
+        repo_path, 
+        &mut parsed_files, 
+        &js_parser, 
+        &ts_parser,
+        &rust_parser,
+        &go_parser,
+        &py_parser
+    )?;
     
     info!("📄 Successfully parsed {} files", parsed_files.len());
     Ok(parsed_files)
@@ -265,6 +284,9 @@ fn walk_directory(
     parsed_files: &mut Vec<ParsedFile>,
     js_parser: &JavaScriptParser,
     ts_parser: &TypeScriptParser,
+    rust_parser: &RustParser,
+    go_parser: &GoParser,
+    py_parser: &PythonParser,
 ) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
@@ -288,7 +310,15 @@ fn walk_directory(
         
         if path.is_dir() {
             // Recursively walk subdirectories
-            walk_directory(&path, parsed_files, js_parser, ts_parser)?;
+            walk_directory(
+                &path, 
+                parsed_files, 
+                js_parser, 
+                ts_parser,
+                rust_parser,
+                go_parser,
+                py_parser
+            )?;
         } else if path.is_file() {
             // Parse files based on extension
             if let Some(extension) = path.extension() {
@@ -302,6 +332,15 @@ fn walk_directory(
                     }
                     "ts" | "tsx" => {
                         ts_parser.parse_file(&path, &content).ok()
+                    }
+                    "rs" => {
+                        rust_parser.parse_file(&path, &content).ok()
+                    }
+                    "go" => {
+                        go_parser.parse_file(&path, &content).ok()
+                    }
+                    "py" => {
+                        py_parser.parse_file(&path, &content).ok()
                     }
                     _ => None,
                 };
@@ -323,17 +362,28 @@ fn walk_directory(
 fn extract_dependencies(parsed_files: &[ParsedFile]) -> Result<Vec<Dependency>> {
     let mut dependencies = Vec::new();
     
-    // Build a map of all functions defined in the codebase
+    // Build a map of all functions defined in the codebase (including methods)
     let mut defined_functions: HashMap<String, String> = HashMap::new();
     for file in parsed_files {
         for func in &file.functions {
             defined_functions.insert(func.name.clone(), file.path.clone());
         }
+        for class in &file.classes {
+            for method in &class.methods {
+                 defined_functions.insert(method.name.clone(), file.path.clone());
+            }
+        }
     }
     
     // Extract dependencies from function calls
     for file in parsed_files {
-        for func in &file.functions {
+        // Collect all functions to iterate (standalone + methods)
+        let mut all_functions = file.functions.iter().collect::<Vec<_>>();
+        for class in &file.classes {
+            all_functions.extend(class.methods.iter());
+        }
+
+        for func in all_functions {
             for call in &func.calls {
                 // Check if this call is to a function defined in our codebase
                 if let Some(target_file) = defined_functions.get(call) {
@@ -392,7 +442,57 @@ async fn store_in_neo4j(
         .param("job_id", job_id);
         graph.run(file_query).await.context("Failed to create file node")?;
         
-        // Create function nodes
+        // Create class nodes
+        for class in &file.classes {
+             let class_query = neo4rs::query(
+                 "MERGE (c:Class {name: $name, file: $file})
+                  SET c.start_line = $start_line,
+                      c.end_line = $end_line,
+                      c.job_id = $job_id"
+             )
+             .param("name", class.name.clone())
+             .param("file", file.path.clone())
+             .param("start_line", class.start_line as i64)
+             .param("end_line", class.end_line as i64)
+             .param("job_id", job_id);
+             graph.run(class_query).await.context("Failed to create class node")?;
+
+             // Link class to file
+             let link_class_query = neo4rs::query(
+                 "MATCH (f:File {path: $file}), (c:Class {name: $name, file: $file})
+                  MERGE (f)-[:DEFINES]->(c)"
+             )
+             .param("file", file.path.clone())
+             .param("name", class.name.clone());
+             graph.run(link_class_query).await.context("Failed to link class to file")?;
+
+             // Create methods and link to class
+             for method in &class.methods {
+                 let method_query = neo4rs::query(
+                     "MERGE (m:Function {name: $name, file: $file})
+                      SET m.start_line = $start_line,
+                          m.end_line = $end_line,
+                          m.job_id = $job_id"
+                 )
+                 .param("name", method.name.clone())
+                 .param("file", file.path.clone())
+                 .param("start_line", method.start_line as i64)
+                 .param("end_line", method.end_line as i64)
+                 .param("job_id", job_id);
+                 graph.run(method_query).await.context("Failed to create method node")?;
+
+                 let link_method_query = neo4rs::query(
+                     "MATCH (c:Class {name: $cname, file: $file}), (m:Function {name: $mname, file: $file})
+                      MERGE (c)-[:DEFINES]->(m)"
+                 )
+                 .param("cname", class.name.clone())
+                 .param("file", file.path.clone())
+                 .param("mname", method.name.clone());
+                 graph.run(link_method_query).await.context("Failed to link method to class")?;
+             }
+        }
+
+        // Create function nodes (standalone)
         for func in &file.functions {
             let func_query = neo4rs::query(
                 "MERGE (fn:Function {name: $name, file: $file})

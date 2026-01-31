@@ -1,5 +1,8 @@
 pub mod javascript;
 pub mod typescript;
+pub mod rust_parser;
+pub mod go_parser;
+pub mod python_parser;
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -9,7 +12,6 @@ pub struct ParsedFile {
     pub path: String,
     pub language: String,
     pub functions: Vec<FunctionInfo>,
-    #[allow(dead_code)]
     pub classes: Vec<ClassInfo>,
     pub imports: Vec<String>,
 }
@@ -17,16 +19,20 @@ pub struct ParsedFile {
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
     pub name: String,
+    pub params: Vec<String>,
+    pub return_type: Option<String>,
     pub calls: Vec<String>,
     pub start_line: usize,
     pub end_line: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
     pub name: String,
-    pub methods: Vec<String>,
+    pub parents: Vec<String>,
+    pub methods: Vec<FunctionInfo>,
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 pub trait LanguageParser {
