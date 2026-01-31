@@ -1,4 +1,5 @@
 mod graph_builder;
+mod neo4j_storage;
 mod parsers;
 
 use anyhow::{Context, Result};
@@ -198,9 +199,9 @@ async fn analyze_repository(job: &AnalysisJob, neo4j_graph: &neo4rs::Graph) -> R
           stats.defines_edges, stats.calls_edges, stats.imports_edges, 
           stats.inherits_edges, stats.contains_edges);
 
-    // Step 5: Store in Neo4j
-    store_in_neo4j(neo4j_graph, &job.job_id, &dep_graph).await?;
-    info!("💾 Stored graph data in Neo4j");
+    // Step 5: Store in Neo4j (batch operations with transactions)
+    neo4j_storage::store_graph(neo4j_graph, &job.job_id, &parsed_files, &dep_graph, None).await?;
+    info!("💾 Stored graph data in Neo4j (batch mode)");
 
     // TODO: Update job status to COMPLETED in PostgreSQL via API call or direct DB connection
 
@@ -371,159 +372,5 @@ fn walk_directory(
         }
     }
     
-    Ok(())
-}
-
-
-
-async fn store_in_neo4j(
-    graph: &neo4rs::Graph,
-    job_id: &str,
-    dep_graph: &graph_builder::DependencyGraph,
-) -> Result<()> {
-    info!("💾 Storing graph data in Neo4j...");
-
-    // Create job node
-    let job_query = neo4rs::query(
-        "CREATE (j:Job {id: $id, status: 'COMPLETED', timestamp: datetime()})"
-    )
-    .param("id", job_id);
-    graph.run(job_query).await.context("Failed to create job node")?;
-
-    // Create all nodes
-    for node in &dep_graph.nodes {
-        match node {
-            graph_builder::NodeId::File(path) => {
-                let query = neo4rs::query(
-                    "MERGE (f:File {path: $path})
-                     SET f.job_id = $job_id"
-                )
-                .param("path", path.clone())
-                .param("job_id", job_id);
-                graph.run(query).await.context("Failed to create file node")?;
-            }
-            graph_builder::NodeId::Class(file, name) => {
-                let query = neo4rs::query(
-                    "MERGE (c:Class {name: $name, file: $file})
-                     SET c.job_id = $job_id"
-                )
-                .param("name", name.clone())
-                .param("file", file.clone())
-                .param("job_id", job_id);
-                graph.run(query).await.context("Failed to create class node")?;
-            }
-            graph_builder::NodeId::Function(file, name) => {
-                let query = neo4rs::query(
-                    "MERGE (fn:Function {name: $name, file: $file})
-                     SET fn.job_id = $job_id"
-                )
-                .param("name", name.clone())
-                .param("file", file.clone())
-                .param("job_id", job_id);
-                graph.run(query).await.context("Failed to create function node")?;
-            }
-            graph_builder::NodeId::Module(name) => {
-                let query = neo4rs::query(
-                    "MERGE (m:Module {name: $name})
-                     SET m.job_id = $job_id"
-                )
-                .param("name", name.clone())
-                .param("job_id", job_id);
-                graph.run(query).await.context("Failed to create module node")?;
-            }
-        }
-    }
-
-    // Create all edges
-    for edge in &dep_graph.edges {
-        let edge_type = edge.edge_type.as_str();
-        
-        let query_str = match (&edge.from, &edge.to) {
-            (graph_builder::NodeId::File(from_path), graph_builder::NodeId::Class(to_file, to_name)) => {
-                format!(
-                    "MATCH (from:File {{path: $from_id}})
-                     MATCH (to:Class {{name: $to_name, file: $to_file}})
-                     MERGE (from)-[:{}]->(to)", edge_type
-                )
-            }
-            (graph_builder::NodeId::File(from_path), graph_builder::NodeId::Function(to_file, to_name)) => {
-                format!(
-                    "MATCH (from:File {{path: $from_id}})
-                     MATCH (to:Function {{name: $to_name, file: $to_file}})
-                     MERGE (from)-[:{}]->(to)", edge_type
-                )
-            }
-            (graph_builder::NodeId::File(_), graph_builder::NodeId::Module(to_name)) => {
-                format!(
-                    "MATCH (from:File {{path: $from_id}})
-                     MATCH (to:Module {{name: $to_name}})
-                     MERGE (from)-[:{}]->(to)", edge_type
-                )
-            }
-            (graph_builder::NodeId::Class(from_file, from_name), graph_builder::NodeId::Function(to_file, to_name)) => {
-                format!(
-                    "MATCH (from:Class {{name: $from_name, file: $from_file}})
-                     MATCH (to:Function {{name: $to_name, file: $to_file}})
-                     MERGE (from)-[:{}]->(to)", edge_type
-                )
-            }
-            (graph_builder::NodeId::Class(from_file, from_name), graph_builder::NodeId::Class(to_file, to_name)) => {
-                format!(
-                    "MATCH (from:Class {{name: $from_name, file: $from_file}})
-                     MATCH (to:Class {{name: $to_name, file: $to_file}})
-                     MERGE (from)-[:{}]->(to)", edge_type
-                )
-            }
-            (graph_builder::NodeId::Class(_, _), graph_builder::NodeId::Module(to_name)) => {
-                format!(
-                    "MATCH (from:Class {{name: $from_name, file: $from_file}})
-                     MATCH (to:Module {{name: $to_name}})
-                     MERGE (from)-[:{}]->(to)", edge_type
-                )
-            }
-            (graph_builder::NodeId::Function(from_file, from_name), graph_builder::NodeId::Function(to_file, to_name)) => {
-                format!(
-                    "MATCH (from:Function {{name: $from_name, file: $from_file}})
-                     MATCH (to:Function {{name: $to_name, file: $to_file}})
-                     MERGE (from)-[:{}]->(to)", edge_type
-                )
-            }
-            _ => continue, // Skip unsupported edge types
-        };
-
-        let mut query = neo4rs::query(&query_str);
-
-        // Add parameters based on node types
-        match &edge.from {
-            graph_builder::NodeId::File(path) => {
-                query = query.param("from_id", path.clone());
-            }
-            graph_builder::NodeId::Class(file, name) | graph_builder::NodeId::Function(file, name) => {
-                query = query.param("from_name", name.clone());
-                query = query.param("from_file", file.clone());
-            }
-            _ => {}
-        }
-
-        match &edge.to {
-            graph_builder::NodeId::File(path) => {
-                query = query.param("to_id", path.clone());
-            }
-            graph_builder::NodeId::Class(file, name) | graph_builder::NodeId::Function(file, name) => {
-                query = query.param("to_name", name.clone());
-                query = query.param("to_file", file.clone());
-            }
-            graph_builder::NodeId::Module(name) => {
-                query = query.param("to_name", name.clone());
-            }
-        }
-
-        // Ignore errors for edge creation (some may not match if nodes don't exist)
-        graph.run(query).await.ok();
-    }
-
-    info!("✅ Successfully stored {} nodes and {} edges in Neo4j",
-          dep_graph.nodes.len(),
-          dep_graph.edges.len());
     Ok(())
 }
