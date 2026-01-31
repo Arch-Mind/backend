@@ -204,7 +204,8 @@ impl LanguageParser for JavaScriptParser {
                  let end_line = class_node.end_position().row + 1;
 
                  let mut parents = Vec::new();
-                 let parent_matches = query_cursor.matches(&inheritance_query, class_node, content.as_bytes());
+                 let mut parent_cursor = QueryCursor::new();
+                 let parent_matches = parent_cursor.matches(&inheritance_query, class_node, content.as_bytes());
                  for pm in parent_matches {
                       for c in pm.captures {
                           parents.push(content[c.node.byte_range()].to_string());

@@ -158,7 +158,8 @@ impl LanguageParser for PythonParser {
                  let end_line = node.end_position().row + 1;
                  
                  let mut parents = Vec::new();
-                 let im = query_cursor.matches(&inheritance_query, node, content.as_bytes());
+                 let mut parent_cursor = QueryCursor::new();
+                 let im = parent_cursor.matches(&inheritance_query, node, content.as_bytes());
                  for pm in im {
                      for c in pm.captures {
                          if inheritance_query.capture_names()[c.index as usize] == "parent" {
