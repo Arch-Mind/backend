@@ -153,36 +153,37 @@ async def get_impact_analysis(node_id: str, depth: int = 3):
 async def get_repository_metrics(repo_id: str):
     """
     Calculate and return metrics for a repository.
+    repo_id is the job_id from the analysis job.
     """
     if not neo4j_driver:
         raise HTTPException(status_code=503, detail="Neo4j connection not available")
 
     try:
         with neo4j_driver.session() as session:
-            # Count files
+            # Count files - using job_id property
             files_result = session.run(
-                "MATCH (f:File {repo_id: $repo_id}) RETURN count(f) as count",
+                "MATCH (f:File {job_id: $repo_id}) RETURN count(f) as count",
                 repo_id=repo_id
             )
             total_files = files_result.single()["count"]
 
             # Count functions
             functions_result = session.run(
-                "MATCH (fn:Function {repo_id: $repo_id}) RETURN count(fn) as count",
+                "MATCH (fn:Function {job_id: $repo_id}) RETURN count(fn) as count",
                 repo_id=repo_id
             )
             total_functions = functions_result.single()["count"]
 
             # Count classes
             classes_result = session.run(
-                "MATCH (c:Class {repo_id: $repo_id}) RETURN count(c) as count",
+                "MATCH (c:Class {job_id: $repo_id}) RETURN count(c) as count",
                 repo_id=repo_id
             )
             total_classes = classes_result.single()["count"]
 
-            # Count dependencies
+            # Count dependencies (edges don't have job_id, count by matching nodes)
             deps_result = session.run(
-                "MATCH ()-[r:CALLS|IMPORTS|INHERITS]->() WHERE r.repo_id = $repo_id RETURN count(r) as count",
+                "MATCH (a {job_id: $repo_id})-[r:CALLS|IMPORTS|INHERITS]->(b {job_id: $repo_id}) RETURN count(r) as count",
                 repo_id=repo_id
             )
             total_dependencies = deps_result.single()["count"]
@@ -206,44 +207,71 @@ async def get_repository_metrics(repo_id: str):
 async def get_dependency_graph(repo_id: str, limit: int = 100):
     """
     Retrieve the full dependency graph for a repository.
+    repo_id is the job_id from the analysis job.
     """
     if not neo4j_driver:
         raise HTTPException(status_code=503, detail="Neo4j connection not available")
 
     try:
         with neo4j_driver.session() as session:
-            # Get nodes
+            # Get nodes - using job_id property
+            # Use COALESCE to handle different property names across node types
             nodes_query = """
-            MATCH (n {repo_id: $repo_id})
-            RETURN n.id as id, n.name as name, labels(n)[0] as type, properties(n) as props
+            MATCH (n {job_id: $repo_id})
+            RETURN 
+                COALESCE(n.path, n.name, n.id, toString(id(n))) as id,
+                COALESCE(n.name, n.path, toString(id(n))) as name,
+                labels(n)[0] as type,
+                properties(n) as props
             LIMIT $limit
             """
             nodes_result = session.run(nodes_query, repo_id=repo_id, limit=limit)
-            nodes = [
-                GraphNode(
-                    id=record["id"],
-                    label=record["name"],
-                    type=record["type"],
-                    properties=record["props"]
-                )
-                for record in nodes_result
-            ]
+            nodes = []
+            for record in nodes_result:
+                try:
+                    node_id = str(record["id"]) if record["id"] else f"node_{len(nodes)}"
+                    node_name = str(record["name"]) if record["name"] else node_id
+                    # For files, extract just the filename from the path
+                    if record["type"] == "File" and "/" in node_name:
+                        node_name = node_name.split("/")[-1]
+                    elif record["type"] == "File" and "\\" in node_name:
+                        node_name = node_name.split("\\")[-1]
+                    
+                    node = GraphNode(
+                        id=node_id,
+                        label=node_name,
+                        type=record["type"] or "Unknown",
+                        properties=record["props"] or {}
+                    )
+                    nodes.append(node)
+                except Exception as e:
+                    logger.warning(f"Skipping invalid node: {e}")
 
-            # Get edges
+            # Get edges - using job_id property
+            # Use COALESCE for source/target IDs to match node IDs
             edges_query = """
-            MATCH (a {repo_id: $repo_id})-[r]->(b {repo_id: $repo_id})
-            RETURN a.id as source, b.id as target, type(r) as type
+            MATCH (a {job_id: $repo_id})-[r]->(b {job_id: $repo_id})
+            RETURN 
+                COALESCE(a.path, a.name, a.id, toString(id(a))) as source,
+                COALESCE(b.path, b.name, b.id, toString(id(b))) as target,
+                type(r) as type
             LIMIT $limit
             """
             edges_result = session.run(edges_query, repo_id=repo_id, limit=limit)
-            edges = [
-                GraphEdge(
-                    source=record["source"],
-                    target=record["target"],
-                    type=record["type"]
-                )
-                for record in edges_result
-            ]
+            edges = []
+            for record in edges_result:
+                try:
+                    source = str(record["source"]) if record["source"] else None
+                    target = str(record["target"]) if record["target"] else None
+                    if source and target:
+                        edge = GraphEdge(
+                            source=source,
+                            target=target,
+                            type=record["type"] or "UNKNOWN"
+                        )
+                        edges.append(edge)
+                except Exception as e:
+                    logger.warning(f"Skipping invalid edge: {e}")
 
             return GraphResponse(nodes=nodes, edges=edges)
     except Exception as e:

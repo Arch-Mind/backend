@@ -36,6 +36,7 @@ struct Config {
     neo4j_uri: String,
     neo4j_user: String,
     neo4j_password: String,
+    postgres_url: String,
 }
 
 impl Config {
@@ -47,8 +48,47 @@ impl Config {
             neo4j_uri: env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string()),
             neo4j_user: env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string()),
             neo4j_password: env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "password".to_string()),
+            postgres_url: env::var("POSTGRES_URL").unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5432/archmind".to_string()),
         })
     }
+}
+
+use tokio_postgres::NoTls;
+
+async fn update_job_status(postgres_url: &str, job_id: &str, status: &str, error_msg: Option<&str>) -> Result<()> {
+    let (client, connection) = tokio_postgres::connect(postgres_url, NoTls)
+        .await
+        .context("Failed to connect to PostgreSQL")?;
+
+    // Spawn the connection handler
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            error!("PostgreSQL connection error: {}", e);
+        }
+    });
+
+    // Use NaiveDateTime for PostgreSQL timestamp columns (without timezone)
+    let now = chrono::Utc::now().naive_utc();
+    
+    if status == "COMPLETED" {
+        client.execute(
+            "UPDATE analysis_jobs SET status = $1, completed_at = $2, updated_at = $2 WHERE job_id = $3",
+            &[&status, &now, &job_id],
+        ).await.context("Failed to update job status")?;
+    } else if status == "FAILED" {
+        client.execute(
+            "UPDATE analysis_jobs SET status = $1, error_message = $2, completed_at = $3, updated_at = $3 WHERE job_id = $4",
+            &[&status, &error_msg.unwrap_or("Unknown error"), &now, &job_id],
+        ).await.context("Failed to update job status")?;
+    } else {
+        client.execute(
+            "UPDATE analysis_jobs SET status = $1, updated_at = $2 WHERE job_id = $3",
+            &[&status, &now, &job_id],
+        ).await.context("Failed to update job status")?;
+    }
+
+    info!("📊 Updated job {} status to {}", job_id, status);
+    Ok(())
 }
 
 #[tokio::main]
@@ -65,6 +105,7 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let config = Config::from_env()?;
+    let postgres_url = config.postgres_url.clone();
 
     // Connect to Redis
     let redis_client = redis::Client::open(config.redis_url.as_str())
@@ -90,7 +131,7 @@ async fn main() -> Result<()> {
     // Main worker loop
     info!("👂 Listening for jobs on analysis_queue...");
     loop {
-        match process_job(&mut redis_conn, &neo4j_graph).await {
+        match process_job(&mut redis_conn, &neo4j_graph, &postgres_url).await {
             Ok(processed) => {
                 if !processed {
                     // No job available, sleep briefly
@@ -108,6 +149,7 @@ async fn main() -> Result<()> {
 async fn process_job(
     redis_conn: &mut redis::aio::Connection,
     neo4j_graph: &neo4rs::Graph,
+    postgres_url: &str,
 ) -> Result<bool> {
     // Block and wait for job from Redis queue (BRPOP with 5 second timeout)
     let result: Option<(String, String)> = redis_conn
@@ -122,14 +164,27 @@ async fn process_job(
 
         info!("📝 Processing job: {} for repo: {}", job.job_id, job.repo_url);
 
+        // Update status to PROCESSING
+        if let Err(e) = update_job_status(postgres_url, &job.job_id, "PROCESSING", None).await {
+            error!("Failed to update job status to PROCESSING: {:?}", e);
+        }
+
         // Process the job
         match analyze_repository(&job, neo4j_graph).await {
             Ok(_) => {
                 info!("✅ Successfully processed job: {}", job.job_id);
+                // Update status to COMPLETED
+                if let Err(e) = update_job_status(postgres_url, &job.job_id, "COMPLETED", None).await {
+                    error!("Failed to update job status to COMPLETED: {:?}", e);
+                }
             }
             Err(e) => {
                 error!("❌ Failed to process job {}: {:?}", job.job_id, e);
-                // TODO: Update job status to FAILED in PostgreSQL
+                // Update status to FAILED
+                let error_msg = format!("{:?}", e);
+                if let Err(e) = update_job_status(postgres_url, &job.job_id, "FAILED", Some(&error_msg)).await {
+                    error!("Failed to update job status to FAILED: {:?}", e);
+                }
             }
         }
 
@@ -246,10 +301,27 @@ fn clone_repository(
     if head_name != branch {
         info!("🔀 Switching to branch: {}", branch);
         
-        let (object, reference) = repo.revparse_ext(branch).or_else(|_| {
-            // Try looking for remote branch
-            repo.revparse_ext(&format!("origin/{}", branch))
-        }).context(format!("Branch '{}' not found", branch))?;
+        // Try the specified branch, then fallback to common branch names
+        let branches_to_try = vec![
+            branch.to_string(),
+            format!("origin/{}", branch),
+            "master".to_string(),
+            "origin/master".to_string(),
+            "main".to_string(),
+            "origin/main".to_string(),
+        ];
+        
+        let mut found = None;
+        for branch_name in &branches_to_try {
+            if let Ok(result) = repo.revparse_ext(branch_name) {
+                info!("✅ Found branch: {}", branch_name);
+                found = Some(result);
+                break;
+            }
+        }
+        
+        let (object, reference) = found
+            .ok_or_else(|| anyhow::anyhow!("No valid branch found. Tried: {:?}", branches_to_try))?;
 
         repo.checkout_tree(&object, None)
             .context("Failed to checkout branch tree")?;
@@ -265,6 +337,8 @@ fn clone_repository(
                      .context("Failed to set HEAD detached")?;
             }
         }
+    } else {
+        info!("✅ Already on branch: {}", head_name);
     }
 
     Ok(TempRepo { path: tmp_dir })
