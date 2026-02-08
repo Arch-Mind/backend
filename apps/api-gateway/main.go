@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -377,9 +378,21 @@ func analyzeRepository(c *gin.Context) {
 		return
 	}
 
+	// Validate repository URL
+	if !validateRepoURL(req.RepoURL) {
+		validationError(c, "repo_url", "Invalid git repository URL format. Expected HTTPS, SSH, or Git URL.")
+		return
+	}
+
 	// Set default branch if not provided
 	if req.Branch == "" {
 		req.Branch = "main"
+	}
+
+	// Validate branch name
+	if !validateBranchName(req.Branch) {
+		validationError(c, "branch", "Invalid branch name format. Use alphanumeric, dashes, underscores, dots, or slashes.")
+		return
 	}
 
 	// Create job ID
@@ -437,6 +450,10 @@ func analyzeRepository(c *gin.Context) {
 // getJobStatus retrieves the status of a specific job
 func getJobStatus(c *gin.Context) {
 	jobID := c.Param("id")
+	if !validateUUID(jobID) {
+		validationError(c, "id", "Invalid UUID format for job ID.")
+		return
+	}
 
 	// Query database for job
 	var job AnalysisJob
@@ -471,6 +488,10 @@ func getJobStatus(c *gin.Context) {
 // updateJob handles the PATCH /api/v1/jobs/:id endpoint
 func updateJob(c *gin.Context) {
 	jobID := c.Param("id")
+	if !validateUUID(jobID) {
+		validationError(c, "id", "Invalid UUID format for job ID.")
+		return
+	}
 
 	// Parse request body
 	var req JobUpdateRequest
@@ -1054,4 +1075,49 @@ func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []st
 	}
 
 	return jobID, nil
+}
+
+// validateRepoURL validates if the repository URL is a valid Git URL
+func validateRepoURL(url string) bool {
+	// Regex for standard HTTPS, SSH, and Git URLs
+	// Supports:
+	// - https://github.com/user/repo
+	// - https://github.com/user/repo.git
+	// - git@github.com:user/repo.git
+	// - ssh://user@server/project.git
+	regex := regexp.MustCompile(`^(?:https?://|git@|ssh://)(?:[^@]+@)?[^/]+(?:[:/][^/]+)+(\.git)?$`)
+	return regex.MatchString(url)
+}
+
+// validateBranchName validates if the branch name is safe and valid
+func validateBranchName(branch string) bool {
+	// Allow alphanumeric, dashes, underscores, slashes, and dots
+	// Disallow dangerous characters like spaces, control chars, ~, ^, :, *, ?, [, \
+	if len(branch) == 0 || len(branch) > 255 {
+		return false
+	}
+	// Simplified git branch validation
+	regex := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]+$`)
+
+	// Check for ".." which can be used for directory traversal in some contexts
+	if strings.Contains(branch, "..") {
+		return false
+	}
+
+	return regex.MatchString(branch)
+}
+
+// validateUUID checks if the string is a valid UUID
+func validateUUID(id string) bool {
+	_, err := uuid.Parse(id)
+	return err == nil
+}
+
+// validationError sends a formatted 400 Bad Request response
+func validationError(c *gin.Context, field, message string) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error":   "Validation Error",
+		"field":   field,
+		"message": message,
+	})
 }

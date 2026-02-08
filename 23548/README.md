@@ -5,14 +5,14 @@
 **Student**: 23548  
 **Date**: February 8, 2026  
 **Completed Tasks**:
-1. **API Gateway**: PATCH Endpoint + Retry + Shutdown
+1. **API Gateway**: PATCH Endpoint + Retry + Shutdown + **Validation**
 2. **Ingestion Worker**: Status Reporting + Retry + Shutdown
 3. **Graph Engine**: Optimization + Retry + Shutdown
 4. **Cross-Cutting**: Connection Retry Logic & Graceful Shutdown
 
 ---
 
-## 📁 Folder Contents
+## 📁 23548 Folder Contents
 
 ### 1. API Gateway (Go)
 | File | Description |
@@ -20,6 +20,7 @@
 | `main_test.go` | PATCH endpoint unit tests |
 | `api_gateway_retry_test.go` | PostgreSQL retry tests |
 | `api_gateway_shutdown_test.go` | Graceful shutdown tests |
+| `api_gateway_validation_test.go` | Validation input tests |
 | `UNIT_TESTING_DOCUMENTATION.md` | Endpoint documentation |
 
 ### 2. Ingestion Worker (Rust)
@@ -39,17 +40,18 @@
 | `graph_engine_shutdown_test.py` | Shutdown event tests |
 | `GRAPH_ENGINE_TEST_DOCS.md` | Feature documentation |
 
-### 4. Shared Documentation
+### 4. Shared Documentation (Consolidated)
 | File | Description |
 |------|-------------|
 | `RETRY_LOGIC_TEST_DOCS.md` | Connection retry guide |
 | `SHUTDOWN_TEST_DOCS.md` | Graceful shutdown guide |
+| `VALIDATION_TEST_DOCS.md` | Validation guide |
 | `README.md` | Master overview (this file) |
 
 ---
 
 ## ✅ Task 1: API Gateway
-- **Features**: PATCH /jobs/:id, Validation, DB Updates
+- **Features**: PATCH /jobs/:id, **Input Validation** (Regex/UUID)
 - **Reliability**: PostgreSQL Retry (5x), Graceful Shutdown (30s)
 - **Status**: ✅ All tests PASSED
 
@@ -65,37 +67,11 @@
 
 ---
 
-## 🚀 How to Run All Tests
-
-### API Gateway (Go)
-```bash
-cd apps/api-gateway
-go test -v .
-```
-
-### Ingestion Worker (Rust)
-```bash
-cd services/ingestion-worker
-cargo test
-```
-
-### Graph Engine (Python)
-```bash
-cd services/graph-engine
-pytest -v
-```
-
----
-
 ## 🏆 Final Summary
 
-| Metric | Count |
-|--------|-------|
-| **Services Tested** | 3 |
-| **Languages** | Go, Rust, Python |
-| **Test Files** | 9 source files |
-| **Total Tests** | 100+ cases |
-| **Status** | ✅ **100% COMPLETE** |
+**Total Services Tested**: 3 (Go, Rust, Python)  
+**Total Test Files**: 10 source files  
+**Total Test Cases**: 140+ cases  
 
 **Student**: 23548  
 **Assignment**: Complete Backend Testing Suite
