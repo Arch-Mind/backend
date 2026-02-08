@@ -128,6 +128,7 @@ type AnalyzeRequest struct {
 // AnalysisJob represents a job in the queue
 type AnalysisJob struct {
 	JobID     string            `json:"job_id"`
+	RepoID    string            `json:"repo_id"` // Deterministic ID based on RepoURL
 	RepoURL   string            `json:"repo_url"`
 	Branch    string            `json:"branch"`
 	Status    string            `json:"status"`
@@ -138,6 +139,7 @@ type AnalysisJob struct {
 // JobResponse represents the response after creating a job
 type JobResponse struct {
 	JobID     string    `json:"job_id"`
+	RepoID    string    `json:"repo_id"`
 	Status    string    `json:"status"`
 	Message   string    `json:"message"`
 	CreatedAt time.Time `json:"created_at"`
@@ -367,6 +369,17 @@ func healthCheck(c *gin.Context) {
 	})
 }
 
+// generateRepoID generates a deterministic UUID v5 based on the repository URL
+func generateRepoID(repoURL string) string {
+	// Normalize URL: lowercase, remove .git suffix, remove trailing slash
+	normalized := strings.ToLower(strings.TrimSpace(repoURL))
+	normalized = strings.TrimSuffix(normalized, ".git")
+	normalized = strings.TrimSuffix(normalized, "/")
+
+	// Generate UUID v5 using NameSpaceURL and the normalized URL
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(normalized)).String()
+}
+
 // analyzeRepository handles the POST /api/v1/analyze endpoint
 func analyzeRepository(c *gin.Context) {
 	var req AnalyzeRequest
@@ -398,9 +411,13 @@ func analyzeRepository(c *gin.Context) {
 	// Create job ID
 	jobID := uuid.New().String()
 
+	// Generate deterministic Repo ID
+	repoID := generateRepoID(req.RepoURL)
+
 	// Create job object
 	job := AnalysisJob{
 		JobID:     jobID,
+		RepoID:    repoID,
 		RepoURL:   req.RepoURL,
 		Branch:    req.Branch,
 		Status:    "QUEUED",
@@ -409,6 +426,8 @@ func analyzeRepository(c *gin.Context) {
 	}
 
 	// Store job in PostgreSQL
+	// Note: We currently don't store RepoID in Postgres as it requires schema migration
+	// It is passed to Redis for the worker to use
 	if err := storeJob(job); err != nil {
 		log.Printf("Failed to store job in database: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -436,11 +455,12 @@ func analyzeRepository(c *gin.Context) {
 		return
 	}
 
-	log.Printf("📝 Created analysis job: %s for repo: %s", jobID, req.RepoURL)
+	log.Printf("📝 Created analysis job: %s for repo: %s (ID: %s)", jobID, req.RepoURL, repoID)
 
 	// Return response
 	c.JSON(http.StatusCreated, JobResponse{
 		JobID:     jobID,
+		RepoID:    repoID,
 		Status:    "QUEUED",
 		Message:   "Analysis job created successfully",
 		CreatedAt: job.CreatedAt,

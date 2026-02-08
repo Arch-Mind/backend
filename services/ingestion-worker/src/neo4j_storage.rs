@@ -35,16 +35,17 @@ impl Default for BatchConfig {
 type BoltMap = HashMap<String, String>;
 type BoltMapI64 = HashMap<String, i64>;
 
-fn file_node_to_map(path: &str, language: &str, job_id: &str) -> BoltMap {
+fn file_node_to_map(path: &str, language: &str, job_id: &str, repo_id: &str) -> BoltMap {
     let mut m = HashMap::new();
     m.insert("id".to_string(), path.to_string()); // ID is the relative path
     m.insert("path".to_string(), path.to_string());
     m.insert("language".to_string(), language.to_string());
     m.insert("job_id".to_string(), job_id.to_string());
+    m.insert("repo_id".to_string(), repo_id.to_string());
     m
 }
 
-fn class_node_to_map(name: &str, file: &str, start_line: usize, end_line: usize, job_id: &str) -> HashMap<String, neo4rs::BoltType> {
+fn class_node_to_map(name: &str, file: &str, start_line: usize, end_line: usize, job_id: &str, repo_id: &str) -> HashMap<String, neo4rs::BoltType> {
     let mut m: HashMap<String, neo4rs::BoltType> = HashMap::new();
     let id = format!("{}::{}", file, name); // ID is file::name
     m.insert("id".to_string(), id.into());
@@ -53,10 +54,11 @@ fn class_node_to_map(name: &str, file: &str, start_line: usize, end_line: usize,
     m.insert("start_line".to_string(), (start_line as i64).into());
     m.insert("end_line".to_string(), (end_line as i64).into());
     m.insert("job_id".to_string(), job_id.to_string().into());
+    m.insert("repo_id".to_string(), repo_id.to_string().into());
     m
 }
 
-fn function_node_to_map(func: &FunctionInfo, file: &str, job_id: &str) -> HashMap<String, neo4rs::BoltType> {
+fn function_node_to_map(func: &FunctionInfo, file: &str, job_id: &str, repo_id: &str) -> HashMap<String, neo4rs::BoltType> {
     let mut m: HashMap<String, neo4rs::BoltType> = HashMap::new();
     let id = format!("{}::{}", file, func.name); // ID is file::name
     m.insert("id".to_string(), id.into());
@@ -67,13 +69,15 @@ fn function_node_to_map(func: &FunctionInfo, file: &str, job_id: &str) -> HashMa
     m.insert("params".to_string(), func.params.clone().into());
     m.insert("return_type".to_string(), func.return_type.clone().unwrap_or_default().into());
     m.insert("job_id".to_string(), job_id.to_string().into());
+    m.insert("repo_id".to_string(), repo_id.to_string().into());
     m
 }
 
-fn module_node_to_map(name: &str, job_id: &str) -> BoltMap {
+fn module_node_to_map(name: &str, job_id: &str, repo_id: &str) -> BoltMap {
     let mut m = HashMap::new();
     m.insert("name".to_string(), name.to_string());
     m.insert("job_id".to_string(), job_id.to_string());
+    m.insert("repo_id".to_string(), repo_id.to_string());
     m
 }
 
@@ -109,6 +113,7 @@ fn edge_3_map(k1: &str, v1: &str, k2: &str, v2: &str, k3: &str, v3: &str) -> Bol
 pub async fn store_graph(
     graph_db: &neo4rs::Graph,
     job_id: &str,
+    repo_id: &str,
     parsed_files: &[ParsedFile],
     dep_graph: &DependencyGraph,
     config: Option<BatchConfig>,
@@ -120,7 +125,7 @@ pub async fn store_graph(
     let mut txn = graph_db.start_txn().await.context("Failed to start transaction")?;
 
     // Execute batch operations with error handling
-    let result = execute_batch_operations(&mut txn, job_id, parsed_files, dep_graph, &config).await;
+    let result = execute_batch_operations(&mut txn, job_id, repo_id, parsed_files, dep_graph, &config).await;
 
     match result {
         Ok(_) => {
@@ -139,18 +144,19 @@ pub async fn store_graph(
 async fn execute_batch_operations(
     txn: &mut neo4rs::Txn,
     job_id: &str,
+    repo_id: &str,
     parsed_files: &[ParsedFile],
     dep_graph: &DependencyGraph,
     config: &BatchConfig,
 ) -> Result<()> {
     // 1. Create Job node
-    create_job_node(txn, job_id).await?;
+    create_job_node(txn, job_id, repo_id).await?;
 
     // 2. Batch insert nodes
-    batch_insert_file_nodes(txn, job_id, parsed_files, config.batch_size).await?;
-    batch_insert_class_nodes(txn, job_id, parsed_files, config.batch_size).await?;
-    batch_insert_function_nodes(txn, job_id, parsed_files, config.batch_size).await?;
-    batch_insert_module_nodes(txn, job_id, dep_graph, config.batch_size).await?;
+    batch_insert_file_nodes(txn, job_id, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_class_nodes(txn, job_id, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_function_nodes(txn, job_id, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_module_nodes(txn, job_id, repo_id, dep_graph, config.batch_size).await?;
 
     // 3. Batch insert edges
     batch_insert_defines_edges(txn, dep_graph, config.batch_size).await?;
@@ -166,11 +172,12 @@ async fn execute_batch_operations(
 // Job Node
 // ============================================================================
 
-async fn create_job_node(txn: &mut neo4rs::Txn, job_id: &str) -> Result<()> {
+async fn create_job_node(txn: &mut neo4rs::Txn, job_id: &str, repo_id: &str) -> Result<()> {
     let q = query(
-        "CREATE (j:Job {id: $id, status: 'COMPLETED', timestamp: datetime()})"
+        "CREATE (j:Job {id: $id, repo_id: $repo_id, status: 'COMPLETED', timestamp: datetime()})"
     )
-    .param("id", job_id);
+    .param("id", job_id)
+    .param("repo_id", repo_id);
     
     txn.run(q).await.context("Failed to create job node")?;
     info!("   Created Job node: {}", job_id);
@@ -184,12 +191,13 @@ async fn create_job_node(txn: &mut neo4rs::Txn, job_id: &str) -> Result<()> {
 async fn batch_insert_file_nodes(
     txn: &mut neo4rs::Txn,
     job_id: &str,
+    repo_id: &str,
     parsed_files: &[ParsedFile],
     batch_size: usize,
 ) -> Result<()> {
     let nodes: Vec<BoltMap> = parsed_files
         .iter()
-        .map(|f| file_node_to_map(&f.path, &f.language, job_id))
+        .map(|f| file_node_to_map(&f.path, &f.language, job_id, repo_id))
         .collect();
 
     for chunk in nodes.chunks(batch_size) {
@@ -198,7 +206,8 @@ async fn batch_insert_file_nodes(
              MERGE (f:File {id: node.id})
              SET f.path = node.path,
                  f.language = node.language,
-                 f.job_id = node.job_id"
+                 f.job_id = node.job_id,
+                 f.repo_id = node.repo_id"
         )
         .param("nodes", chunk.to_vec());
         
@@ -212,6 +221,7 @@ async fn batch_insert_file_nodes(
 async fn batch_insert_class_nodes(
     txn: &mut neo4rs::Txn,
     job_id: &str,
+    repo_id: &str,
     parsed_files: &[ParsedFile],
     batch_size: usize,
 ) -> Result<()> {
@@ -219,7 +229,7 @@ async fn batch_insert_class_nodes(
     
     for file in parsed_files {
         for class in &file.classes {
-            nodes.push(class_node_to_map(&class.name, &file.path, class.start_line, class.end_line, job_id));
+            nodes.push(class_node_to_map(&class.name, &file.path, class.start_line, class.end_line, job_id, repo_id));
         }
     }
 
@@ -231,7 +241,8 @@ async fn batch_insert_class_nodes(
                  c.file = node.file,
                  c.start_line = node.start_line,
                  c.end_line = node.end_line,
-                 c.job_id = node.job_id"
+                 c.job_id = node.job_id,
+                 c.repo_id = node.repo_id"
         )
         .param("nodes", chunk.to_vec());
         
@@ -245,6 +256,7 @@ async fn batch_insert_class_nodes(
 async fn batch_insert_function_nodes(
     txn: &mut neo4rs::Txn,
     job_id: &str,
+    repo_id: &str,
     parsed_files: &[ParsedFile],
     batch_size: usize,
 ) -> Result<()> {
@@ -253,13 +265,13 @@ async fn batch_insert_function_nodes(
     for file in parsed_files {
         // Top-level functions
         for func in &file.functions {
-            nodes.push(function_node_to_map(func, &file.path, job_id));
+            nodes.push(function_node_to_map(func, &file.path, job_id, repo_id));
         }
         
         // Class methods
         for class in &file.classes {
             for method in &class.methods {
-                nodes.push(function_node_to_map(method, &file.path, job_id));
+                nodes.push(function_node_to_map(method, &file.path, job_id, repo_id));
             }
         }
     }
@@ -274,7 +286,8 @@ async fn batch_insert_function_nodes(
                  fn.end_line = node.end_line,
                  fn.params = node.params,
                  fn.return_type = node.return_type,
-                 fn.job_id = node.job_id"
+                 fn.job_id = node.job_id,
+                 fn.repo_id = node.repo_id"
         )
         .param("nodes", chunk.to_vec());
         
@@ -288,6 +301,7 @@ async fn batch_insert_function_nodes(
 async fn batch_insert_module_nodes(
     txn: &mut neo4rs::Txn,
     job_id: &str,
+    repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
 ) -> Result<()> {
@@ -296,7 +310,7 @@ async fn batch_insert_module_nodes(
         .iter()
         .filter_map(|n| {
             if let NodeId::Module(name) = n {
-                Some(module_node_to_map(name, job_id))
+                Some(module_node_to_map(name, job_id, repo_id))
             } else {
                 None
             }
@@ -307,7 +321,8 @@ async fn batch_insert_module_nodes(
         let q = query(
             "UNWIND $nodes AS node
              MERGE (m:Module {name: node.name})
-             SET m.job_id = node.job_id"
+             SET m.job_id = node.job_id,
+                 m.repo_id = node.repo_id"
         )
         .param("nodes", chunk.to_vec());
         
@@ -551,3 +566,79 @@ async fn batch_insert_inherits_edges(
     info!("   Created {} INHERITS edges", class_to_class.len() + class_to_module.len());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parsers::{FunctionInfo, ClassInfo};
+
+    #[test]
+    fn test_file_node_mapping_includes_repo_id() {
+        let job_id = "job-123";
+        let repo_id = "repo-456";
+        let path = "src/main.rs";
+        let language = "rust";
+
+        let map = file_node_to_map(path, language, job_id, repo_id);
+
+        assert_eq!(map.get("repo_id"), Some(&repo_id.to_string()));
+        assert_eq!(map.get("job_id"), Some(&job_id.to_string()));
+        assert_eq!(map.get("path"), Some(&path.to_string()));
+        assert_eq!(map.get("id"), Some(&path.to_string()));
+    }
+
+    #[test]
+    fn test_module_node_mapping_includes_repo_id() {
+        let job_id = "job-123";
+        let repo_id = "repo-456";
+        let name = "my_module";
+
+        let map = module_node_to_map(name, job_id, repo_id);
+
+        assert_eq!(map.get("repo_id"), Some(&repo_id.to_string()));
+        assert_eq!(map.get("job_id"), Some(&job_id.to_string()));
+        assert_eq!(map.get("name"), Some(&name.to_string()));
+    }
+
+    // Since BoltType is complex to check equality on directly in HashMap, 
+    // we verify keys exist and values are present (conceptually)
+    // Note: BoltType doesn't implement Eq, so we can't easily assert_eq! on the map values directly
+    // apart from String ones if converted. But we can check keys.
+    #[test]
+    fn test_function_node_keys_include_repo_id() {
+        let job_id = "job-123";
+        let repo_id = "repo-456";
+        let file = "src/main.rs";
+        
+        let func = FunctionInfo {
+            name: "my_func".to_string(),
+            params: vec!["arg1".to_string()],
+            return_type: Some("void".to_string()),
+            calls: vec![],
+            start_line: 10,
+            end_line: 20,
+        };
+
+        let map = function_node_to_map(&func, file, job_id, repo_id);
+
+        assert!(map.contains_key("repo_id"));
+        assert!(map.contains_key("job_id"));
+        assert!(map.contains_key("id"));
+        assert!(map.contains_key("name"));
+    }
+
+    #[test]
+    fn test_class_node_keys_include_repo_id() {
+        let job_id = "job-123";
+        let repo_id = "repo-456";
+        let file = "src/main.rs";
+        let name = "MyClass";
+
+        let map = class_node_to_map(name, file, 10, 20, job_id, repo_id);
+
+        assert!(map.contains_key("repo_id"));
+        assert!(map.contains_key("job_id"));
+        assert!(map.contains_key("id"));
+    }
+}
+

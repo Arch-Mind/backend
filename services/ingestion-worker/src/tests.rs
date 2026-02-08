@@ -233,3 +233,23 @@ fn test_walk_directory_relative_paths() {
     assert_eq!(parsed_files[0].path, "src/main.rs");
     assert_eq!(parsed_files[0].language, "rust");
 }
+
+#[test]
+fn test_analysis_job_deserialization_with_repo_id() {
+    let json = r#"{
+        \"job_id\": \"job-123\",
+        \"repo_id\": \"repo-456\",
+        \"repo_url\": \"https://github.com/test\",
+        \"branch\": \"main\",
+        \"status\": \"QUEUED\",
+        \"created_at\": \"2023-01-01T00:00:00Z\"
+    }"#;
+
+    // We need to use super::AnalysisJob since it is defined in main.rs
+    let job: AnalysisJob = serde_json::from_str(json).expect("Failed to deserialize");
+    
+    assert_eq!(job.job_id, "job-123");
+    assert_eq!(job.repo_id, "repo-456");
+    assert_eq!(job.repo_url, "https://github.com/test");
+}
+

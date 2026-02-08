@@ -23,6 +23,7 @@ use tracing::{error, info};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AnalysisJob {
     job_id: String,
+    repo_id: String,
     repo_url: String,
     branch: String,
     status: String,
@@ -446,7 +447,7 @@ async fn analyze_repository(
     }
 
     // Step 5: Store in Neo4j (batch operations with transactions)
-    neo4j_storage::store_graph(neo4j_graph, &job.job_id, &parsed_files, &dep_graph, None).await?;
+    neo4j_storage::store_graph(neo4j_graph, &job.job_id, &job.repo_id, &parsed_files, &dep_graph, None).await?;
     info!("💾 Stored graph data in Neo4j (batch mode)");
 
     // Update progress: 90%
