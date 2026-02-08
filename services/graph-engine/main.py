@@ -548,11 +548,23 @@ async def calculate_pagerank(repo_id: str):
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
+    logger.info("🛑 Shutting down Graph Engine...")
     if neo4j_driver:
-        neo4j_driver.close()
-        logger.info("Neo4j connection closed")
+        try:
+            neo4j_driver.close()
+            logger.info("✅ Neo4j driver closed successfully")
+        except Exception as e:
+            logger.error(f"❌ Error closing Neo4j driver: {e}")
+    logger.info("👋 Graph Engine shutdown complete")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    # Configure uvicorn with graceful shutdown timeout
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        timeout_graceful_shutdown=30  # 30-second shutdown timeout
+    )

@@ -12,8 +12,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -177,12 +179,59 @@ func main() {
 	// Initialize Gin router
 	router := setupRouter()
 
-	// Start server
+	// Configure HTTP server
 	port := getEnv("PORT", "8080")
-	log.Printf("🚀 API Gateway starting on port %s", port)
-	if err := router.Run(":" + port); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: router,
 	}
+
+	// Start server in a goroutine
+	go func() {
+		log.Printf("🚀 API Gateway starting on port %s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	// Setup graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for interrupt signal
+	<-quit
+	log.Println("🛑 Shutting down API Gateway...")
+
+	// Create shutdown context with 30-second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Shutdown HTTP server gracefully
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("⚠️  Server forced to shutdown: %v", err)
+	} else {
+		log.Println("✅ HTTP server stopped")
+	}
+
+	// Close database connections
+	if db != nil {
+		if err := db.Close(); err != nil {
+			log.Printf("⚠️  Error closing PostgreSQL: %v", err)
+		} else {
+			log.Println("✅ PostgreSQL connection closed")
+		}
+	}
+
+	// Close Redis connection
+	if redisClient != nil {
+		if err := redisClient.Close(); err != nil {
+			log.Printf("⚠️  Error closing Redis: %v", err)
+		} else {
+			log.Println("✅ Redis connection closed")
+		}
+	}
+
+	log.Println("👋 API Gateway shutdown complete")
 }
 
 // initRedis initializes the Redis client

@@ -216,9 +216,29 @@ async fn main() -> Result<()> {
 
     info!("✅ Connected to Neo4j");
 
+    // Setup shutdown signal handler
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::signal;
+    
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    
+    tokio::spawn(async move {
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                info!("🛑 Shutdown signal received, finishing current job...");
+                shutdown_clone.store(true, Ordering::SeqCst);
+            }
+            Err(err) => {
+                error!("Failed to listen for shutdown signal: {}", err);
+            }
+        }
+    });
+
     // Main worker loop
     info!("👂 Listening for jobs on analysis_queue...");
-    loop {
+    while !shutdown.load(Ordering::SeqCst) {
         match process_job(&mut redis_conn, &neo4j_graph, &api_client).await {
             Ok(processed) => {
                 if !processed {
@@ -230,6 +250,40 @@ async fn main() -> Result<()> {
                 error!("Error processing job: {:?}", e);
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
+        }
+    }
+
+    // Cleanup on shutdown
+    info!("🧹 Cleaning up temporary files...");
+    cleanup_temp_files().await;
+    
+    info!("👋 Ingestion Worker shutdown complete");
+    Ok(())
+}
+
+/// Clean up temporary repository clones
+async fn cleanup_temp_files() {
+    use std::path::Path;
+    use tokio::fs;
+    
+    let temp_dir = std::env::temp_dir();
+    let archmind_pattern = "archmind-";
+    
+    if let Ok(mut entries) = fs::read_dir(&temp_dir).await {
+        let mut cleanup_count = 0;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(file_name) = entry.file_name().into_string() {
+                if file_name.starts_with(archmind_pattern) {
+                    if let Err(e) = fs::remove_dir_all(entry.path()).await {
+                        warn!("Failed to remove temp dir {}: {}", file_name, e);
+                    } else {
+                        cleanup_count += 1;
+                    }
+                }
+            }
+        }
+        if cleanup_count > 0 {
+            info!("✅ Cleaned up {} temporary directories", cleanup_count);
         }
     }
 }
