@@ -151,13 +151,14 @@ async fn process_job(
     neo4j_graph: &neo4rs::Graph,
     postgres_url: &str,
 ) -> Result<bool> {
-    // Block and wait for job from Redis queue (BRPOP with 5 second timeout)
-    let result: Option<(String, String)> = redis_conn
-        .brpop("analysis_queue", 5.0)
+    // Use RPOP instead of BRPOP for compatibility with Redis 3.x (Windows)
+    // which doesn't support float timeouts sent by the redis crate
+    let result: Option<String> = redis_conn
+        .rpop("analysis_queue", None)
         .await
         .context("Failed to pop from Redis queue")?;
 
-    if let Some((_, job_json)) = result {
+    if let Some(job_json) = result {
         // Deserialize job
         let job: AnalysisJob = serde_json::from_str(&job_json)
             .context("Failed to deserialize job")?;

@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     repo_id INTEGER REFERENCES repositories(id) ON DELETE SET NULL,
     branch VARCHAR(255) NOT NULL DEFAULT 'main',
     status VARCHAR(50) NOT NULL DEFAULT 'QUEUED',
+    progress INTEGER DEFAULT 0,
     options JSONB DEFAULT '{}',
     result_summary JSONB,
     error_message TEXT,

@@ -140,6 +140,22 @@ type JobResponse struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// JobUpdateRequest represents the request to update a job
+type JobUpdateRequest struct {
+	Status        *string                `json:"status,omitempty"`
+	Progress      *int                   `json:"progress,omitempty"`
+	ResultSummary map[string]interface{} `json:"result_summary,omitempty"`
+	Error         *string                `json:"error,omitempty"`
+}
+
+// JobUpdateResponse represents the response after updating a job
+type JobUpdateResponse struct {
+	JobID     string    `json:"job_id"`
+	Status    string    `json:"status"`
+	Message   string    `json:"message"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 var (
 	redisClient *redis.Client
 	db          *sql.DB
@@ -208,7 +224,7 @@ func setupRouter() *gin.Engine {
 	// CORS middleware
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"http://localhost:3000"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
@@ -230,6 +246,7 @@ func setupRouter() *gin.Engine {
 		// Repository analysis
 		v1.POST("/analyze", analyzeRepository)
 		v1.GET("/jobs/:id", getJobStatus)
+		v1.PATCH("/jobs/:id", updateJob)
 		v1.GET("/jobs", listJobs)
 
 		// Repository management
@@ -366,6 +383,82 @@ func getJobStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, job)
 }
 
+// updateJob handles the PATCH /api/v1/jobs/:id endpoint
+func updateJob(c *gin.Context) {
+	jobID := c.Param("id")
+
+	// Parse request body
+	var req JobUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request body",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Validate progress range if provided
+	if req.Progress != nil && (*req.Progress < 0 || *req.Progress > 100) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Progress must be between 0 and 100",
+		})
+		return
+	}
+
+	// Get current job status from database
+	var currentStatus string
+	err := db.QueryRow("SELECT status FROM analysis_jobs WHERE job_id = $1", jobID).Scan(&currentStatus)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Job not found",
+		})
+		return
+	} else if err != nil {
+		log.Printf("Database error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to retrieve job",
+		})
+		return
+	}
+
+	// Validate status transition if status is being updated
+	if req.Status != nil {
+		if !validateStatusTransition(currentStatus, *req.Status) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":          "Invalid status transition",
+				"current_status": currentStatus,
+				"new_status":     *req.Status,
+			})
+			return
+		}
+	}
+
+	// Update job in database
+	updatedAt, err := updateJobInDB(jobID, req)
+	if err != nil {
+		log.Printf("Failed to update job: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to update job",
+		})
+		return
+	}
+
+	// Determine final status for response
+	finalStatus := currentStatus
+	if req.Status != nil {
+		finalStatus = *req.Status
+	}
+
+	log.Printf("📝 Updated job %s: status=%s", jobID, finalStatus)
+
+	c.JSON(http.StatusOK, JobUpdateResponse{
+		JobID:     jobID,
+		Status:    finalStatus,
+		Message:   "Job updated successfully",
+		UpdatedAt: updatedAt,
+	})
+}
+
 // listJobs retrieves all analysis jobs
 func listJobs(c *gin.Context) {
 	rows, err := db.Query(`
@@ -491,6 +584,97 @@ func storeJob(job AnalysisJob) error {
 	`, job.JobID, job.RepoURL, job.Branch, job.Status, optionsJSON, job.CreatedAt)
 
 	return err
+}
+
+// validateStatusTransition checks if a status transition is valid
+func validateStatusTransition(currentStatus, newStatus string) bool {
+	// Define valid transitions
+	validTransitions := map[string][]string{
+		"QUEUED":     {"PROCESSING", "CANCELLED"},
+		"PROCESSING": {"COMPLETED", "FAILED", "CANCELLED"},
+		"COMPLETED":  {}, // Terminal state
+		"FAILED":     {}, // Terminal state
+		"CANCELLED":  {}, // Terminal state
+	}
+
+	allowedTransitions, exists := validTransitions[currentStatus]
+	if !exists {
+		return false
+	}
+
+	// Check if new status is in allowed transitions
+	for _, allowed := range allowedTransitions {
+		if allowed == newStatus {
+			return true
+		}
+	}
+
+	return false
+}
+
+// updateJobInDB updates a job in the database with the provided fields
+func updateJobInDB(jobID string, req JobUpdateRequest) (time.Time, error) {
+	// Build dynamic UPDATE query based on provided fields
+	updates := []string{}
+	args := []interface{}{}
+	argIndex := 1
+
+	if req.Status != nil {
+		updates = append(updates, fmt.Sprintf("status = $%d", argIndex))
+		args = append(args, *req.Status)
+		argIndex++
+
+		// Set completed_at if status is COMPLETED or FAILED
+		if *req.Status == "COMPLETED" || *req.Status == "FAILED" {
+			updates = append(updates, fmt.Sprintf("completed_at = $%d", argIndex))
+			args = append(args, time.Now().UTC())
+			argIndex++
+		}
+	}
+
+	if req.Progress != nil {
+		updates = append(updates, fmt.Sprintf("progress = $%d", argIndex))
+		args = append(args, *req.Progress)
+		argIndex++
+	}
+
+	if req.ResultSummary != nil {
+		resultJSON, err := json.Marshal(req.ResultSummary)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to marshal result_summary: %w", err)
+		}
+		updates = append(updates, fmt.Sprintf("result_summary = $%d", argIndex))
+		args = append(args, resultJSON)
+		argIndex++
+	}
+
+	if req.Error != nil {
+		updates = append(updates, fmt.Sprintf("error_message = $%d", argIndex))
+		args = append(args, *req.Error)
+		argIndex++
+	}
+
+	if len(updates) == 0 {
+		return time.Time{}, fmt.Errorf("no fields to update")
+	}
+
+	// Add job_id as the last argument
+	args = append(args, jobID)
+
+	// Build and execute query
+	query := fmt.Sprintf(
+		"UPDATE analysis_jobs SET %s WHERE job_id = $%d RETURNING updated_at",
+		strings.Join(updates, ", "),
+		argIndex,
+	)
+
+	var updatedAt time.Time
+	err := db.QueryRow(query, args...).Scan(&updatedAt)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to execute update: %w", err)
+	}
+
+	return updatedAt, nil
 }
 
 // getEnv retrieves an environment variable with a fallback default value
