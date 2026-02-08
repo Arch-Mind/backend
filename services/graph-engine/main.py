@@ -74,6 +74,63 @@ class GraphEdge(BaseModel):
 class GraphResponse(BaseModel):
     nodes: List[GraphNode]
     edges: List[GraphEdge]
+    total_nodes: Optional[int] = None
+    total_edges: Optional[int] = None
+
+
+class PaginatedGraphResponse(BaseModel):
+    nodes: List[GraphNode]
+    edges: List[GraphEdge]
+    total_nodes: int
+    total_edges: int
+    limit: int
+    offset: int
+    has_more: bool
+
+
+class ErrorResponse(BaseModel):
+    error: str
+    details: Optional[str] = None
+    repo_id: Optional[str] = None
+
+
+# Helper functions
+def validate_repo_id(repo_id: str) -> bool:
+    """Validate repo_id format (UUID)."""
+    import re
+    uuid_pattern = r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
+    return bool(re.match(uuid_pattern, repo_id, re.I))
+
+
+async def check_repo_exists(session, repo_id: str) -> bool:
+    """Check if repo_id exists in the database."""
+    try:
+        result = session.run(
+            "MATCH (n {job_id: $repo_id}) RETURN count(n) as count LIMIT 1",
+            repo_id=repo_id
+        )
+        record = result.single()
+        return record and record["count"] > 0
+    except Exception as e:
+        logger.error(f"Error checking repo existence: {e}")
+        return False
+
+
+async def get_total_count(session, query: str, repo_id: str) -> int:
+    """Get total count for pagination."""
+    try:
+        result = session.run(query, repo_id=repo_id)
+        record = result.single()
+        return record["count"] if record else 0
+    except Exception:
+        return 0
+
+
+def validate_pagination_params(limit: int, offset: int) -> tuple:
+    """Validate and normalize pagination parameters."""
+    limit = max(1, min(limit, 1000))  # Clamp between 1 and 1000
+    offset = max(0, offset)  # Non-negative
+    return limit, offset
 
 
 # Routes
@@ -158,35 +215,54 @@ async def get_repository_metrics(repo_id: str):
     if not neo4j_driver:
         raise HTTPException(status_code=503, detail="Neo4j connection not available")
 
+    # Validate repo_id format
+    if not validate_repo_id(repo_id):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid repo_id format. Expected UUID, got: {repo_id}"
+        )
+
     try:
         with neo4j_driver.session() as session:
+            # Check if repo exists
+            repo_exists = await check_repo_exists(session, repo_id)
+            if not repo_exists:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Repository not found: {repo_id}. Please ensure the analysis job has completed successfully."
+                )
+
             # Count files - using job_id property
             files_result = session.run(
                 "MATCH (f:File {job_id: $repo_id}) RETURN count(f) as count",
                 repo_id=repo_id
             )
-            total_files = files_result.single()["count"]
+            files_record = files_result.single()
+            total_files = files_record["count"] if files_record else 0
 
             # Count functions
             functions_result = session.run(
                 "MATCH (fn:Function {job_id: $repo_id}) RETURN count(fn) as count",
                 repo_id=repo_id
             )
-            total_functions = functions_result.single()["count"]
+            functions_record = functions_result.single()
+            total_functions = functions_record["count"] if functions_record else 0
 
             # Count classes
             classes_result = session.run(
                 "MATCH (c:Class {job_id: $repo_id}) RETURN count(c) as count",
                 repo_id=repo_id
             )
-            total_classes = classes_result.single()["count"]
+            classes_record = classes_result.single()
+            total_classes = classes_record["count"] if classes_record else 0
 
             # Count dependencies (edges don't have job_id, count by matching nodes)
             deps_result = session.run(
                 "MATCH (a {job_id: $repo_id})-[r:CALLS|IMPORTS|INHERITS]->(b {job_id: $repo_id}) RETURN count(r) as count",
                 repo_id=repo_id
             )
-            total_dependencies = deps_result.single()["count"]
+            deps_record = deps_result.single()
+            total_dependencies = deps_record["count"] if deps_record else 0
 
             # Calculate complexity score (simplified)
             complexity_score = (total_dependencies / max(total_functions, 1)) * 10
@@ -198,24 +274,52 @@ async def get_repository_metrics(repo_id: str):
                 total_dependencies=total_dependencies,
                 complexity_score=round(complexity_score, 2)
             )
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Metrics calculation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Metrics calculation error for {repo_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @app.get("/api/graph/{repo_id}")
-async def get_dependency_graph(repo_id: str, limit: int = 100):
+async def get_dependency_graph(repo_id: str, limit: int = 100, offset: int = 0):
     """
-    Retrieve the full dependency graph for a repository.
+    Retrieve the full dependency graph for a repository with pagination.
     repo_id is the job_id from the analysis job.
     """
     if not neo4j_driver:
         raise HTTPException(status_code=503, detail="Neo4j connection not available")
 
+    # Validate repo_id format
+    if not validate_repo_id(repo_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid repo_id format. Expected UUID, got: {repo_id}"
+        )
+
+    # Validate and normalize pagination parameters
+    limit, offset = validate_pagination_params(limit, offset)
+
     try:
         with neo4j_driver.session() as session:
-            # Get nodes - using job_id property
-            # Use COALESCE to handle different property names across node types
+            # Check if repo exists
+            repo_exists = await check_repo_exists(session, repo_id)
+            if not repo_exists:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Repository not found: {repo_id}. Please ensure the analysis job has completed successfully."
+                )
+
+            # Get total count of nodes
+            total_nodes_query = "MATCH (n {job_id: $repo_id}) RETURN count(n) as count"
+            total_nodes = await get_total_count(session, total_nodes_query, repo_id)
+
+            # Get total count of edges
+            total_edges_query = "MATCH (a {job_id: $repo_id})-[r]->(b {job_id: $repo_id}) RETURN count(r) as count"
+            total_edges = await get_total_count(session, total_edges_query, repo_id)
+
+            # Get nodes with pagination
             nodes_query = """
             MATCH (n {job_id: $repo_id})
             RETURN 
@@ -223,9 +327,10 @@ async def get_dependency_graph(repo_id: str, limit: int = 100):
                 COALESCE(n.name, n.path, toString(id(n))) as name,
                 labels(n)[0] as type,
                 properties(n) as props
+            SKIP $offset
             LIMIT $limit
             """
-            nodes_result = session.run(nodes_query, repo_id=repo_id, limit=limit)
+            nodes_result = session.run(nodes_query, repo_id=repo_id, limit=limit, offset=offset)
             nodes = []
             for record in nodes_result:
                 try:
@@ -247,17 +352,17 @@ async def get_dependency_graph(repo_id: str, limit: int = 100):
                 except Exception as e:
                     logger.warning(f"Skipping invalid node: {e}")
 
-            # Get edges - using job_id property
-            # Use COALESCE for source/target IDs to match node IDs
+            # Get edges with pagination
             edges_query = """
             MATCH (a {job_id: $repo_id})-[r]->(b {job_id: $repo_id})
             RETURN 
                 COALESCE(a.path, a.name, a.id, toString(id(a))) as source,
                 COALESCE(b.path, b.name, b.id, toString(id(b))) as target,
                 type(r) as type
+            SKIP $offset
             LIMIT $limit
             """
-            edges_result = session.run(edges_query, repo_id=repo_id, limit=limit)
+            edges_result = session.run(edges_query, repo_id=repo_id, limit=limit, offset=offset)
             edges = []
             for record in edges_result:
                 try:
@@ -273,10 +378,24 @@ async def get_dependency_graph(repo_id: str, limit: int = 100):
                 except Exception as e:
                     logger.warning(f"Skipping invalid edge: {e}")
 
-            return GraphResponse(nodes=nodes, edges=edges)
+            # Check if there are more results
+            has_more = (offset + limit) < max(total_nodes, total_edges)
+
+            return PaginatedGraphResponse(
+                nodes=nodes,
+                edges=edges,
+                total_nodes=total_nodes,
+                total_edges=total_edges,
+                limit=limit,
+                offset=offset,
+                has_more=has_more
+            )
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Graph retrieval error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Graph retrieval error for {repo_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @app.post("/api/query")
@@ -294,6 +413,55 @@ async def execute_cypher_query(query: str, params: Optional[Dict] = None):
             return {"results": records, "count": len(records)}
     except Exception as e:
         logger.error(f"Query execution error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/create-indexes")
+async def create_indexes():
+    """
+    Create indexes on Neo4j for query optimization.
+    This endpoint should be called after initial setup or data import.
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+
+    try:
+        with neo4j_driver.session() as session:
+            indexes_created = []
+            
+            # Create index on job_id for all nodes
+            try:
+                session.run("CREATE INDEX job_id_index IF NOT EXISTS FOR (n) ON (n.job_id)")
+                indexes_created.append("job_id_index")
+            except Exception as e:
+                logger.warning(f"Index job_id_index may already exist: {e}")
+
+            # Create indexes on common properties
+            try:
+                session.run("CREATE INDEX file_path_index IF NOT EXISTS FOR (f:File) ON (f.path)")
+                indexes_created.append("file_path_index")
+            except Exception as e:
+                logger.warning(f"Index file_path_index may already exist: {e}")
+
+            try:
+                session.run("CREATE INDEX function_name_index IF NOT EXISTS FOR (fn:Function) ON (fn.name)")
+                indexes_created.append("function_name_index")
+            except Exception as e:
+                logger.warning(f"Index function_name_index may already exist: {e}")
+
+            try:
+                session.run("CREATE INDEX class_name_index IF NOT EXISTS FOR (c:Class) ON (c.name)")
+                indexes_created.append("class_name_index")
+            except Exception as e:
+                logger.warning(f"Index class_name_index may already exist: {e}")
+
+            return {
+                "message": "Indexes created successfully",
+                "indexes": indexes_created,
+                "count": len(indexes_created)
+            }
+    except Exception as e:
+        logger.error(f"Index creation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
