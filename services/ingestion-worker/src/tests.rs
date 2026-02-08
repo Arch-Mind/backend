@@ -178,3 +178,58 @@ async fn test_api_client_full_workflow_simulation() {
         error: None,
     }).await.expect("Step 6 failed");
 }
+
+#[test]
+fn test_walk_directory_relative_paths() {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use uuid::Uuid;
+    use super::parsers::{
+        javascript::JavaScriptParser,
+        typescript::TypeScriptParser,
+        rust_parser::RustParser,
+        go_parser::GoParser,
+        python_parser::PythonParser,
+        ParsedFile,
+    };
+
+    let uuid = Uuid::new_v4();
+    let temp_dir = std::env::temp_dir().join(format!("test-repo-{}", uuid));
+    fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+    let src_dir = temp_dir.join("src");
+    fs::create_dir(&src_dir).expect("Failed to create src dir");
+
+    let main_rs = src_dir.join("main.rs");
+    let mut file = File::create(&main_rs).expect("Failed to create main.rs");
+    writeln!(file, "fn main() {{}}").expect("Failed to write to main.rs");
+
+    let mut parsed_files: Vec<ParsedFile> = Vec::new();
+    let js_parser = JavaScriptParser::new().unwrap();
+    let ts_parser = TypeScriptParser::new().unwrap();
+    let rust_parser = RustParser::new().unwrap();
+    let go_parser = GoParser::new().unwrap();
+    let py_parser = PythonParser::new().unwrap();
+
+    let result = super::walk_directory(
+        &temp_dir,
+        &temp_dir,
+        &mut parsed_files,
+        &js_parser,
+        &ts_parser,
+        &rust_parser,
+        &go_parser,
+        &py_parser,
+    );
+
+    // Cleanup
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(result.is_ok());
+    assert_eq!(parsed_files.len(), 1);
+    
+    // Check relative path
+    // The logic replaces backslashes with forward slashes
+    assert_eq!(parsed_files[0].path, "src/main.rs");
+    assert_eq!(parsed_files[0].language, "rust");
+}

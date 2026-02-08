@@ -37,6 +37,7 @@ type BoltMapI64 = HashMap<String, i64>;
 
 fn file_node_to_map(path: &str, language: &str, job_id: &str) -> BoltMap {
     let mut m = HashMap::new();
+    m.insert("id".to_string(), path.to_string()); // ID is the relative path
     m.insert("path".to_string(), path.to_string());
     m.insert("language".to_string(), language.to_string());
     m.insert("job_id".to_string(), job_id.to_string());
@@ -45,6 +46,8 @@ fn file_node_to_map(path: &str, language: &str, job_id: &str) -> BoltMap {
 
 fn class_node_to_map(name: &str, file: &str, start_line: usize, end_line: usize, job_id: &str) -> HashMap<String, neo4rs::BoltType> {
     let mut m: HashMap<String, neo4rs::BoltType> = HashMap::new();
+    let id = format!("{}::{}", file, name); // ID is file::name
+    m.insert("id".to_string(), id.into());
     m.insert("name".to_string(), name.to_string().into());
     m.insert("file".to_string(), file.to_string().into());
     m.insert("start_line".to_string(), (start_line as i64).into());
@@ -55,6 +58,8 @@ fn class_node_to_map(name: &str, file: &str, start_line: usize, end_line: usize,
 
 fn function_node_to_map(func: &FunctionInfo, file: &str, job_id: &str) -> HashMap<String, neo4rs::BoltType> {
     let mut m: HashMap<String, neo4rs::BoltType> = HashMap::new();
+    let id = format!("{}::{}", file, func.name); // ID is file::name
+    m.insert("id".to_string(), id.into());
     m.insert("name".to_string(), func.name.clone().into());
     m.insert("file".to_string(), file.to_string().into());
     m.insert("start_line".to_string(), (func.start_line as i64).into());
@@ -190,8 +195,9 @@ async fn batch_insert_file_nodes(
     for chunk in nodes.chunks(batch_size) {
         let q = query(
             "UNWIND $nodes AS node
-             MERGE (f:File {path: node.path})
-             SET f.language = node.language,
+             MERGE (f:File {id: node.id})
+             SET f.path = node.path,
+                 f.language = node.language,
                  f.job_id = node.job_id"
         )
         .param("nodes", chunk.to_vec());
@@ -220,8 +226,10 @@ async fn batch_insert_class_nodes(
     for chunk in nodes.chunks(batch_size) {
         let q = query(
             "UNWIND $nodes AS node
-             MERGE (c:Class {name: node.name, file: node.file})
-             SET c.start_line = node.start_line,
+             MERGE (c:Class {id: node.id})
+             SET c.name = node.name,
+                 c.file = node.file,
+                 c.start_line = node.start_line,
                  c.end_line = node.end_line,
                  c.job_id = node.job_id"
         )
@@ -259,8 +267,10 @@ async fn batch_insert_function_nodes(
     for chunk in nodes.chunks(batch_size) {
         let q = query(
             "UNWIND $nodes AS node
-             MERGE (fn:Function {name: node.name, file: node.file})
-             SET fn.start_line = node.start_line,
+             MERGE (fn:Function {id: node.id})
+             SET fn.name = node.name,
+                 fn.file = node.file,
+                 fn.start_line = node.start_line,
                  fn.end_line = node.end_line,
                  fn.params = node.params,
                  fn.return_type = node.return_type,

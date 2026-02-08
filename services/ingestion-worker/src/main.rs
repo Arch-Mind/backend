@@ -565,7 +565,8 @@ fn parse_repository(repo_path: &std::path::PathBuf) -> Result<Vec<ParsedFile>> {
     
     // Walk directory tree
     walk_directory(
-        repo_path, 
+        repo_path,
+        repo_path, // Pass root directory
         &mut parsed_files, 
         &js_parser, 
         &ts_parser,
@@ -578,8 +579,9 @@ fn parse_repository(repo_path: &std::path::PathBuf) -> Result<Vec<ParsedFile>> {
     Ok(parsed_files)
 }
 
-fn walk_directory(
-    dir: &PathBuf,
+pub(crate) fn walk_directory(
+    root_dir: &PathBuf,
+    current_dir: &PathBuf,
     parsed_files: &mut Vec<ParsedFile>,
     js_parser: &JavaScriptParser,
     ts_parser: &TypeScriptParser,
@@ -587,11 +589,11 @@ fn walk_directory(
     go_parser: &GoParser,
     py_parser: &PythonParser,
 ) -> Result<()> {
-    if !dir.is_dir() {
+    if !current_dir.is_dir() {
         return Ok(());
     }
     
-    for entry in fs::read_dir(dir).context("Failed to read directory")? {
+    for entry in fs::read_dir(current_dir).context("Failed to read directory")? {
         let entry = entry.context("Failed to read directory entry")?;
         let path = entry.path();
         
@@ -602,7 +604,9 @@ fn walk_directory(
                 || name_str == "node_modules"
                 || name_str == "target"
                 || name_str == "dist"
-                || name_str == "build" {
+                || name_str == "build"
+                || name_str == "venv"
+                || name_str == "__pycache__" {
                 continue;
             }
         }
@@ -610,6 +614,7 @@ fn walk_directory(
         if path.is_dir() {
             // Recursively walk subdirectories
             walk_directory(
+                root_dir,
                 &path, 
                 parsed_files, 
                 js_parser, 
@@ -622,31 +627,46 @@ fn walk_directory(
             // Parse files based on extension
             if let Some(extension) = path.extension() {
                 let ext = extension.to_string_lossy().to_lowercase();
+                
+                // Compute relative path for ID consistency
+                // e.g., "src/main.rs" instead of "C:\Users\...\src\main.rs"
+                let relative_path = path.strip_prefix(root_dir).unwrap_or(&path);
+                // Ensure forward slashes for consistency across OS
+                let path_str = relative_path.to_string_lossy().replace("\\", "/");
+                
+                // We fake the path in the parser so that the ParsedFile contains relative path
+                // But we read content from the absolute path
                 let content = fs::read_to_string(&path)
                     .context(format!("Failed to read file: {:?}", path))?;
                 
+                // Create a PathBuf from the relative path string for the parser
+                let relative_path_buf = PathBuf::from(&path_str);
+                
                 let parsed = match ext.as_str() {
                     "js" | "jsx" | "mjs" => {
-                        js_parser.parse_file(&path, &content).ok()
+                        js_parser.parse_file(&relative_path_buf, &content).ok()
                     }
                     "ts" | "tsx" => {
-                        ts_parser.parse_file(&path, &content).ok()
+                        ts_parser.parse_file(&relative_path_buf, &content).ok()
                     }
                     "rs" => {
-                        rust_parser.parse_file(&path, &content).ok()
+                        rust_parser.parse_file(&relative_path_buf, &content).ok()
                     }
                     "go" => {
-                        go_parser.parse_file(&path, &content).ok()
+                        go_parser.parse_file(&relative_path_buf, &content).ok()
                     }
                     "py" => {
-                        py_parser.parse_file(&path, &content).ok()
+                        py_parser.parse_file(&relative_path_buf, &content).ok()
                     }
                     _ => None,
                 };
                 
-                if let Some(parsed_file) = parsed {
-                    info!("✓ Parsed: {:?} ({} functions, {} imports)", 
-                          path, 
+                if let Some(mut parsed_file) = parsed {
+                    // Double check path is standardized
+                    parsed_file.path = path_str;
+                    
+                    info!("✓ Parsed: {} ({} functions, {} imports)", 
+                          parsed_file.path, 
                           parsed_file.functions.len(),
                           parsed_file.imports.len());
                     parsed_files.push(parsed_file);
