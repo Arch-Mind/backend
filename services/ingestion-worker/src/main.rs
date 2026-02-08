@@ -30,13 +30,60 @@ struct AnalysisJob {
     created_at: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct JobUpdatePayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub struct ApiClient {
+    client: reqwest::Client,
+    base_url: String,
+}
+
+impl ApiClient {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url,
+        }
+    }
+
+    pub async fn update_job(&self, job_id: &str, payload: JobUpdatePayload) -> Result<()> {
+        let url = format!("{}/api/v1/jobs/{}", self.base_url, job_id);
+        
+        let response = self.client.patch(&url)
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to send update request")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            error!("Failed to update job status: {}", error_text);
+            return Err(anyhow::anyhow!("API Error: {}", error_text));
+        }
+
+        info!("📊 Updated job {} (status={:?}, progress={:?})", 
+              job_id, payload.status, payload.progress);
+        
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     redis_url: String,
     neo4j_uri: String,
     neo4j_user: String,
     neo4j_password: String,
-    postgres_url: String,
+    api_gateway_url: String,
 }
 
 impl Config {
@@ -48,48 +95,13 @@ impl Config {
             neo4j_uri: env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string()),
             neo4j_user: env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string()),
             neo4j_password: env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "password".to_string()),
-            postgres_url: env::var("POSTGRES_URL").unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5432/archmind".to_string()),
+            neo4j_password: env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "password".to_string()),
+            api_gateway_url: env::var("API_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
         })
     }
 }
 
-use tokio_postgres::NoTls;
 
-async fn update_job_status(postgres_url: &str, job_id: &str, status: &str, error_msg: Option<&str>) -> Result<()> {
-    let (client, connection) = tokio_postgres::connect(postgres_url, NoTls)
-        .await
-        .context("Failed to connect to PostgreSQL")?;
-
-    // Spawn the connection handler
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("PostgreSQL connection error: {}", e);
-        }
-    });
-
-    // Use NaiveDateTime for PostgreSQL timestamp columns (without timezone)
-    let now = chrono::Utc::now().naive_utc();
-    
-    if status == "COMPLETED" {
-        client.execute(
-            "UPDATE analysis_jobs SET status = $1, completed_at = $2, updated_at = $2 WHERE job_id = $3",
-            &[&status, &now, &job_id],
-        ).await.context("Failed to update job status")?;
-    } else if status == "FAILED" {
-        client.execute(
-            "UPDATE analysis_jobs SET status = $1, error_message = $2, completed_at = $3, updated_at = $3 WHERE job_id = $4",
-            &[&status, &error_msg.unwrap_or("Unknown error"), &now, &job_id],
-        ).await.context("Failed to update job status")?;
-    } else {
-        client.execute(
-            "UPDATE analysis_jobs SET status = $1, updated_at = $2 WHERE job_id = $3",
-            &[&status, &now, &job_id],
-        ).await.context("Failed to update job status")?;
-    }
-
-    info!("📊 Updated job {} status to {}", job_id, status);
-    Ok(())
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -105,7 +117,7 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let config = Config::from_env()?;
-    let postgres_url = config.postgres_url.clone();
+    let api_client = ApiClient::new(config.api_gateway_url.clone());
 
     // Connect to Redis
     let redis_client = redis::Client::open(config.redis_url.as_str())
@@ -131,7 +143,7 @@ async fn main() -> Result<()> {
     // Main worker loop
     info!("👂 Listening for jobs on analysis_queue...");
     loop {
-        match process_job(&mut redis_conn, &neo4j_graph, &postgres_url).await {
+        match process_job(&mut redis_conn, &neo4j_graph, &api_client).await {
             Ok(processed) => {
                 if !processed {
                     // No job available, sleep briefly
@@ -149,7 +161,7 @@ async fn main() -> Result<()> {
 async fn process_job(
     redis_conn: &mut redis::aio::Connection,
     neo4j_graph: &neo4rs::Graph,
-    postgres_url: &str,
+    api_client: &ApiClient,
 ) -> Result<bool> {
     // Use RPOP instead of BRPOP for compatibility with Redis 3.x (Windows)
     // which doesn't support float timeouts sent by the redis crate
@@ -165,17 +177,30 @@ async fn process_job(
 
         info!("📝 Processing job: {} for repo: {}", job.job_id, job.repo_url);
 
-        // Update status to PROCESSING
-        if let Err(e) = update_job_status(postgres_url, &job.job_id, "PROCESSING", None).await {
+        // Update status to PROCESSING (0%)
+        let payload = JobUpdatePayload {
+            status: Some("PROCESSING".to_string()),
+            progress: Some(0),
+            result_summary: None,
+            error: None,
+        };
+        
+        if let Err(e) = api_client.update_job(&job.job_id, payload).await {
             error!("Failed to update job status to PROCESSING: {:?}", e);
         }
 
         // Process the job
-        match analyze_repository(&job, neo4j_graph).await {
-            Ok(_) => {
+        match analyze_repository(&job, neo4j_graph, api_client).await {
+            Ok(summary) => {
                 info!("✅ Successfully processed job: {}", job.job_id);
                 // Update status to COMPLETED
-                if let Err(e) = update_job_status(postgres_url, &job.job_id, "COMPLETED", None).await {
+                let payload = JobUpdatePayload {
+                    status: Some("COMPLETED".to_string()),
+                    progress: Some(100),
+                    result_summary: Some(summary),
+                    error: None,
+                };
+                if let Err(e) = api_client.update_job(&job.job_id, payload).await {
                     error!("Failed to update job status to COMPLETED: {:?}", e);
                 }
             }
@@ -183,7 +208,13 @@ async fn process_job(
                 error!("❌ Failed to process job {}: {:?}", job.job_id, e);
                 // Update status to FAILED
                 let error_msg = format!("{:?}", e);
-                if let Err(e) = update_job_status(postgres_url, &job.job_id, "FAILED", Some(&error_msg)).await {
+                let payload = JobUpdatePayload {
+                    status: Some("FAILED".to_string()),
+                    progress: None,
+                    result_summary: None,
+                    error: Some(error_msg),
+                };
+                if let Err(e) = api_client.update_job(&job.job_id, payload).await {
                     error!("Failed to update job status to FAILED: {:?}", e);
                 }
             }
@@ -226,16 +257,40 @@ impl Deref for TempRepo {
     }
 }
 
-async fn analyze_repository(job: &AnalysisJob, neo4j_graph: &neo4rs::Graph) -> Result<()> {
+async fn analyze_repository(
+    job: &AnalysisJob, 
+    neo4j_graph: &neo4rs::Graph,
+    api_client: &ApiClient,
+) -> Result<serde_json::Value> {
     info!("🔍 Analyzing repository: {}", job.repo_url);
 
     // Step 1: Clone repository
     let temp_repo = clone_repository(&job.repo_url, &job.branch, &job.options)?;
     info!("📦 Repository cloned to: {:?}", temp_repo.path);
 
+    // Update progress: 25%
+    if let Err(e) = api_client.update_job(&job.job_id, JobUpdatePayload {
+        status: None,
+        progress: Some(25),
+        result_summary: None,
+        error: None,
+    }).await {
+        error!("Failed to update progress to 25%: {:?}", e);
+    }
+
     // Step 2: Parse source files with tree-sitter
     let parsed_files = parse_repository(&temp_repo.path)?;
     info!("📄 Parsed {} files", parsed_files.len());
+
+    // Update progress: 50%
+    if let Err(e) = api_client.update_job(&job.job_id, JobUpdatePayload {
+        status: None,
+        progress: Some(50),
+        result_summary: None,
+        error: None,
+    }).await {
+        error!("Failed to update progress to 50%: {:?}", e);
+    }
 
     // Step 3: Build symbol table for cross-file resolution
     let symbol_table = graph_builder::SymbolTable::from_parsed_files(&parsed_files);
@@ -249,19 +304,42 @@ async fn analyze_repository(job: &AnalysisJob, neo4j_graph: &neo4rs::Graph) -> R
     info!("🔗 Built dependency graph: {} nodes, {} edges", 
           dep_graph.nodes.len(), 
           dep_graph.edges.len());
-    info!("   - Files: {}, Classes: {}, Functions: {}, Modules: {}",
-          stats.files, stats.classes, stats.functions, stats.modules);
-    info!("   - DEFINES: {}, CALLS: {}, IMPORTS: {}, INHERITS: {}, CONTAINS: {}",
-          stats.defines_edges, stats.calls_edges, stats.imports_edges, 
-          stats.inherits_edges, stats.contains_edges);
+
+    // Update progress: 75%
+    if let Err(e) = api_client.update_job(&job.job_id, JobUpdatePayload {
+        status: None,
+        progress: Some(75),
+        result_summary: None,
+        error: None,
+    }).await {
+        error!("Failed to update progress to 75%: {:?}", e);
+    }
 
     // Step 5: Store in Neo4j (batch operations with transactions)
     neo4j_storage::store_graph(neo4j_graph, &job.job_id, &parsed_files, &dep_graph, None).await?;
     info!("💾 Stored graph data in Neo4j (batch mode)");
 
-    // TODO: Update job status to COMPLETED in PostgreSQL via API call or direct DB connection
+    // Update progress: 90%
+    if let Err(e) = api_client.update_job(&job.job_id, JobUpdatePayload {
+        status: None,
+        progress: Some(90),
+        result_summary: None,
+        error: None,
+    }).await {
+        error!("Failed to update progress to 90%: {:?}", e);
+    }
 
-    Ok(())
+    // Create result summary
+    let summary = serde_json::json!({
+        "total_files": parsed_files.len(),
+        "total_functions": stats.functions,
+        "total_classes": stats.classes,
+        "dependencies": stats.imports_edges,
+        "complexity_score": 0.0, // Placeholder
+        "languages": {} // Placeholder
+    });
+    
+    Ok(summary)
 }
 
 fn clone_repository(
@@ -449,3 +527,6 @@ fn walk_directory(
     
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

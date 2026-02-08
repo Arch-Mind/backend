@@ -1,44 +1,27 @@
 # Important Note About File Locations
 
-## File Organization
+## API Gateway (Go)
+**Working Copy**: `apps/api-gateway/main_test.go`
+**Presentation Copy**: `23548/main_test.go`
 
-### 📁 23548 Folder (Presentation Copy)
-**Location**: `C:\Users\slikh\Documents\Archmind\backend\23548`
-
-**Purpose**: Academic presentation for lecturer
-
-**Contents**:
-- `main_test.go` - Copy of unit tests
-- `UNIT_TESTING_DOCUMENTATION.md` - Documentation
-- `TEST_RESULTS.md` - Test results
-- `test_patch_endpoint.ps1` - Integration tests
-- `README.md` - Overview
-
-**Use**: Show this folder to your lecturer
+**Why**: Go requires test files (`*_test.go`) alongside source files.
 
 ---
 
-### 📁 apps/api-gateway Folder (Working Copy)
-**Location**: `C:\Users\slikh\Documents\Archmind\backend\apps\api-gateway`
+## Ingestion Worker (Rust)
+**Working Copy**: `services/ingestion-worker/src/tests.rs`
+**Presentation Copy**: `23548/ingestion_worker_tests.rs`
 
-**Purpose**: Actual development and testing
+**Why**: 
+1. The test file uses `use super::*;` to access `ApiClient` and structs from `main.rs`.
+2. It must be declared as a module in `main.rs` using `#[cfg(test)] mod tests;`.
+3. Moving it outside `src` or renaming it without updating `main.rs` will break compilation.
 
-**Contents**:
-- `main.go` - Main application code
-- `main_test.go` - Unit tests (must stay here!)
-- Other Go files
-
-**Why `main_test.go` must stay here**:
-1. ✅ Go convention - tests live next to source code
-2. ✅ `go test` command requires it here
-3. ✅ Development workflow expects it here
+**Integration**:
+- `mock_api.py`: Python script to simulate API Gateway.
+- Can be run anywhere, but worker must point to localhost:8080.
 
 ---
 
 ## Summary
-
-- **23548 folder** = Presentation copy for lecturer ✅
-- **api-gateway folder** = Working copy for development ✅
-- **main_test.go exists in both** = This is correct! ✅
-
-The `23548` folder is a snapshot/copy for academic purposes, while the actual working tests remain in the `api-gateway` directory where they belong for proper Go development.
+The `23548` folder contains **copies** for presentation. To run tests, the files must exist in their respective service directories.
