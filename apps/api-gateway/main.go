@@ -30,13 +30,13 @@ import (
 
 // GitHubPushPayload represents the payload from a GitHub push event
 type GitHubPushPayload struct {
-	Ref        string              `json:"ref"`
-	Before     string              `json:"before"`
-	After      string              `json:"after"`
-	Repository GitHubRepository    `json:"repository"`
-	Pusher     GitHubPusher        `json:"pusher"`
-	Commits    []GitHubCommit      `json:"commits"`
-	HeadCommit *GitHubCommit       `json:"head_commit"`
+	Ref        string           `json:"ref"`
+	Before     string           `json:"before"`
+	After      string           `json:"after"`
+	Repository GitHubRepository `json:"repository"`
+	Pusher     GitHubPusher     `json:"pusher"`
+	Commits    []GitHubCommit   `json:"commits"`
+	HeadCommit *GitHubCommit    `json:"head_commit"`
 }
 
 // GitHubPullRequestPayload represents the payload from a GitHub pull_request event
@@ -69,9 +69,9 @@ type GitHubPusher struct {
 
 // GitHubCommit represents a commit in the push payload
 type GitHubCommit struct {
-	ID        string   `json:"id"`
-	Message   string   `json:"message"`
-	Timestamp string   `json:"timestamp"`
+	ID        string `json:"id"`
+	Message   string `json:"message"`
+	Timestamp string `json:"timestamp"`
 	Author    struct {
 		Name  string `json:"name"`
 		Email string `json:"email"`
@@ -117,19 +117,19 @@ var analyzableExtensions = map[string]bool{
 
 // AnalyzeRequest represents the incoming request to analyze a repository
 type AnalyzeRequest struct {
-	RepoURL     string            `json:"repo_url" binding:"required"`
-	Branch      string            `json:"branch"`
-	Options     map[string]string `json:"options"`
+	RepoURL string            `json:"repo_url" binding:"required"`
+	Branch  string            `json:"branch"`
+	Options map[string]string `json:"options"`
 }
 
 // AnalysisJob represents a job in the queue
 type AnalysisJob struct {
-	JobID       string            `json:"job_id"`
-	RepoURL     string            `json:"repo_url"`
-	Branch      string            `json:"branch"`
-	Status      string            `json:"status"`
-	Options     map[string]string `json:"options"`
-	CreatedAt   time.Time         `json:"created_at"`
+	JobID     string            `json:"job_id"`
+	RepoURL   string            `json:"repo_url"`
+	Branch    string            `json:"branch"`
+	Status    string            `json:"status"`
+	Options   map[string]string `json:"options"`
+	CreatedAt time.Time         `json:"created_at"`
 }
 
 // JobResponse represents the response after creating a job
@@ -201,20 +201,56 @@ func initRedis() {
 	log.Println("✅ Connected to Redis")
 }
 
-// initPostgres initializes the PostgreSQL connection
+// initPostgres initializes the PostgreSQL connection with retry logic
 func initPostgres() {
 	dbURL := getEnv("POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/archmind?sslmode=disable")
+	db = connectPostgresWithRetry(dbURL, 5)
+	if db == nil {
+		log.Fatal("Failed to connect to PostgreSQL after all retries")
+	}
+}
+
+// connectPostgresWithRetry attempts to connect to PostgreSQL with exponential backoff
+func connectPostgresWithRetry(dbURL string, maxRetries int) *sql.DB {
+	var connection *sql.DB
 	var err error
-	db, err = sql.Open("postgres", dbURL)
-	if err != nil {
-		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("🔄 Attempting to connect to PostgreSQL... (attempt %d/%d)", attempt, maxRetries)
+
+		connection, err = sql.Open("postgres", dbURL)
+		if err != nil {
+			if attempt < maxRetries {
+				waitTime := time.Duration(1<<uint(attempt-1)) * time.Second // 1s, 2s, 4s, 8s, 16s
+				log.Printf("⚠️  Failed to open PostgreSQL connection: %v. Retrying in %v (attempt %d/%d)...",
+					err, waitTime, attempt, maxRetries)
+				time.Sleep(waitTime)
+				continue
+			}
+			log.Printf("❌ Failed to connect to PostgreSQL after %d attempts: %v", maxRetries, err)
+			return nil
+		}
+
+		// Test the connection
+		err = connection.Ping()
+		if err != nil {
+			connection.Close()
+			if attempt < maxRetries {
+				waitTime := time.Duration(1<<uint(attempt-1)) * time.Second // 1s, 2s, 4s, 8s, 16s
+				log.Printf("⚠️  Failed to ping PostgreSQL: %v. Retrying in %v (attempt %d/%d)...",
+					err, waitTime, attempt, maxRetries)
+				time.Sleep(waitTime)
+				continue
+			}
+			log.Printf("❌ Failed to ping PostgreSQL after %d attempts: %v", maxRetries, err)
+			return nil
+		}
+
+		log.Println("✅ Successfully connected to PostgreSQL")
+		return connection
 	}
 
-	// Test connection
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping PostgreSQL: %v", err)
-	}
-	log.Println("✅ Connected to PostgreSQL")
+	return nil
 }
 
 // setupRouter configures the Gin router with all routes
@@ -286,7 +322,7 @@ func analyzeRepository(c *gin.Context) {
 	var req AnalyzeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Invalid request body",
+			"error":   "Invalid request body",
 			"details": err.Error(),
 		})
 		return
@@ -717,7 +753,7 @@ func handleGitHubWebhook(c *gin.Context) {
 	// Step 3: Check the event type
 	eventType := c.GetHeader("X-GitHub-Event")
 	deliveryID := c.GetHeader("X-GitHub-Delivery")
-	
+
 	log.Printf("📥 Webhook received: event=%s, delivery=%s", eventType, deliveryID)
 
 	// Step 4: Route to appropriate handler based on event type
@@ -785,8 +821,8 @@ func handlePushEvent(c *gin.Context, body []byte) {
 
 	// Extract branch name from ref (refs/heads/main -> main)
 	branch := extractBranchName(payload.Ref)
-	
-	log.Printf("📤 Push event: repo=%s, branch=%s, commits=%d", 
+
+	log.Printf("📤 Push event: repo=%s, branch=%s, commits=%d",
 		payload.Repository.FullName, branch, len(payload.Commits))
 
 	// Check if any analyzable files were changed
@@ -811,7 +847,7 @@ func handlePushEvent(c *gin.Context, body []byte) {
 		return
 	}
 
-	log.Printf("✅ Webhook: Created analysis job %s for push to %s/%s", 
+	log.Printf("✅ Webhook: Created analysis job %s for push to %s/%s",
 		jobID, payload.Repository.FullName, branch)
 
 	// Return 200 OK immediately (must be < 500ms for GitHub)
@@ -851,14 +887,14 @@ func handlePullRequestEvent(c *gin.Context, body []byte) {
 	}
 
 	branch := payload.PullRequest.Head.Ref
-	
+
 	log.Printf("🔀 Pull request event: repo=%s, PR=#%d, action=%s, branch=%s",
 		payload.Repository.FullName, payload.Number, payload.Action, branch)
 
 	// Create and queue analysis job for the PR branch
 	jobID, err := createWebhookAnalysisJob(
-		payload.Repository.CloneURL, 
-		branch, 
+		payload.Repository.CloneURL,
+		branch,
 		"pull_request",
 		nil, // PR events don't include file changes, analyze everything
 	)
@@ -931,7 +967,7 @@ func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []st
 		"trigger": trigger,
 		"source":  "webhook",
 	}
-	
+
 	if len(changedFiles) > 0 {
 		// Store changed files (truncate if too many)
 		maxFiles := 100

@@ -95,12 +95,89 @@ impl Config {
             neo4j_uri: env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string()),
             neo4j_user: env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string()),
             neo4j_password: env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "password".to_string()),
-            neo4j_password: env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "password".to_string()),
             api_gateway_url: env::var("API_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
         })
     }
 }
 
+/// Connect to Redis with exponential backoff retry logic
+async fn connect_redis_with_retry(url: &str, max_retries: u32) -> Result<redis::Client> {
+    use tokio::time::{sleep, Duration};
+
+    for attempt in 1..=max_retries {
+        info!("🔄 Attempting to connect to Redis at {}... (attempt {}/{})", url, attempt, max_retries);
+        
+        match redis::Client::open(url) {
+            Ok(client) => {
+                // Test connection
+                match client.get_async_connection().await {
+                    Ok(_) => {
+                        info!("✅ Successfully connected to Redis");
+                        return Ok(client);
+                    }
+                    Err(e) => {
+                        if attempt < max_retries {
+                            let wait_time = 2u64.pow(attempt - 1); // 1s, 2s, 4s, 8s
+                            warn!("⚠️  Failed to connect to Redis: {}. Retrying in {}s (attempt {}/{})...", 
+                                  e, wait_time, attempt, max_retries);
+                            sleep(Duration::from_secs(wait_time)).await;
+                        } else {
+                            error!("❌ Failed to connect to Redis after {} attempts: {}", max_retries, e);
+                            return Err(anyhow::anyhow!("Redis connection failed after {} retries: {}", max_retries, e));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if attempt < max_retries {
+                    let wait_time = 2u64.pow(attempt - 1);
+                    warn!("⚠️  Failed to create Redis client: {}. Retrying in {}s (attempt {}/{})...", 
+                          e, wait_time, attempt, max_retries);
+                    sleep(Duration::from_secs(wait_time)).await;
+                } else {
+                    error!("❌ Failed to create Redis client after {} attempts: {}", max_retries, e);
+                    return Err(anyhow::anyhow!("Redis client creation failed after {} retries: {}", max_retries, e));
+                }
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("Failed to connect to Redis"))
+}
+
+/// Connect to Neo4j with exponential backoff retry logic
+async fn connect_neo4j_with_retry(
+    uri: &str,
+    user: &str,
+    password: &str,
+    max_retries: u32,
+) -> Result<neo4rs::Graph> {
+    use tokio::time::{sleep, Duration};
+
+    for attempt in 1..=max_retries {
+        info!("🔄 Attempting to connect to Neo4j at {}... (attempt {}/{})", uri, attempt, max_retries);
+        
+        match neo4rs::Graph::new(uri, user, password).await {
+            Ok(graph) => {
+                info!("✅ Successfully connected to Neo4j");
+                return Ok(graph);
+            }
+            Err(e) => {
+                if attempt < max_retries {
+                    let wait_time = 2u64.pow(attempt - 1); // 1s, 2s, 4s, 8s
+                    warn!("⚠️  Failed to connect to Neo4j: {}. Retrying in {}s (attempt {}/{})...", 
+                          e, wait_time, attempt, max_retries);
+                    sleep(Duration::from_secs(wait_time)).await;
+                } else {
+                    error!("❌ Failed to connect to Neo4j after {} attempts: {}", max_retries, e);
+                    return Err(anyhow::anyhow!("Neo4j connection failed after {} retries: {}", max_retries, e));
+                }
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("Failed to connect to Neo4j"))
+}
 
 
 #[tokio::main]
@@ -119,24 +196,23 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let api_client = ApiClient::new(config.api_gateway_url.clone());
 
-    // Connect to Redis
-    let redis_client = redis::Client::open(config.redis_url.as_str())
-        .context("Failed to create Redis client")?;
+    // Connect to Redis with retry
+    let redis_client = connect_redis_with_retry(&config.redis_url, 4).await?;
     let mut redis_conn = redis_client
         .get_async_connection()
         .await
-        .context("Failed to connect to Redis")?;
+        .context("Failed to get Redis async connection")?;
 
     info!("✅ Connected to Redis");
 
-    // Connect to Neo4j
-    let neo4j_graph = neo4rs::Graph::new(
+    // Connect to Neo4j with retry
+    let neo4j_graph = connect_neo4j_with_retry(
         &config.neo4j_uri,
         &config.neo4j_user,
         &config.neo4j_password,
+        4,
     )
-    .await
-    .context("Failed to connect to Neo4j")?;
+    .await?;
 
     info!("✅ Connected to Neo4j");
 

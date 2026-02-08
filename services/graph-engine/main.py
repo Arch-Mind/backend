@@ -36,12 +36,45 @@ neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 neo4j_user = os.getenv("NEO4J_USER", "neo4j")
 neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
 
-try:
-    neo4j_driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
-    logger.info(f"✅ Connected to Neo4j at {neo4j_uri}")
-except Exception as e:
-    logger.error(f"Failed to connect to Neo4j: {e}")
-    neo4j_driver = None
+
+def connect_neo4j_with_retry(uri: str, user: str, password: str, max_retries: int = 4):
+    """
+    Connect to Neo4j with exponential backoff retry logic.
+    
+    Args:
+        uri: Neo4j connection URI
+        user: Username for authentication
+        password: Password for authentication
+        max_retries: Maximum number of retry attempts (default: 4)
+    
+    Returns:
+        Neo4j driver instance or None if all retries fail
+    """
+    import time
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"🔄 Attempting to connect to Neo4j at {uri}... (attempt {attempt}/{max_retries})")
+            driver = GraphDatabase.driver(uri, auth=(user, password))
+            # Verify connectivity
+            driver.verify_connectivity()
+            logger.info(f"✅ Successfully connected to Neo4j at {uri}")
+            return driver
+        except Exception as e:
+            if attempt < max_retries:
+                wait_time = 2 ** (attempt - 1)  # Exponential backoff: 1s, 2s, 4s, 8s
+                logger.warning(
+                    f"⚠️  Failed to connect to Neo4j: {e}. "
+                    f"Retrying in {wait_time}s (attempt {attempt}/{max_retries})..."
+                )
+                time.sleep(wait_time)
+            else:
+                logger.error(f"❌ Failed to connect to Neo4j after {max_retries} attempts: {e}")
+                return None
+
+
+# Initialize Neo4j connection with retry
+neo4j_driver = connect_neo4j_with_retry(neo4j_uri, neo4j_user, neo4j_password)
 
 
 # Pydantic models
