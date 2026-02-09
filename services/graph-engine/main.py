@@ -136,10 +136,11 @@ def validate_repo_id(repo_id: str) -> bool:
 
 
 async def check_repo_exists(session, repo_id: str) -> bool:
-    """Check if repo_id exists in the database."""
+    """Check if repo_id or job_id exists in the database."""
     try:
+        # Check for both repo_id and job_id to support both identifiers
         result = session.run(
-            "MATCH (n {repo_id: $repo_id}) RETURN count(n) as count LIMIT 1",
+            "MATCH (n) WHERE n.repo_id = $repo_id OR n.job_id = $repo_id RETURN count(n) as count LIMIT 1",
             repo_id=repo_id
         )
         record = result.single()
@@ -265,9 +266,9 @@ async def get_repository_metrics(repo_id: str):
                     detail=f"Repository not found: {repo_id}. Please ensure the analysis job has completed successfully."
                 )
 
-            # Count files - using job_id property
+            # Count files - using repo_id or job_id property
             files_result = session.run(
-                "MATCH (f:File {repo_id: $repo_id}) RETURN count(f) as count",
+                "MATCH (f:File) WHERE f.repo_id = $repo_id OR f.job_id = $repo_id RETURN count(f) as count",
                 repo_id=repo_id
             )
             files_record = files_result.single()
@@ -275,7 +276,7 @@ async def get_repository_metrics(repo_id: str):
 
             # Count functions
             functions_result = session.run(
-                "MATCH (fn:Function {repo_id: $repo_id}) RETURN count(fn) as count",
+                "MATCH (fn:Function) WHERE fn.repo_id = $repo_id OR fn.job_id = $repo_id RETURN count(fn) as count",
                 repo_id=repo_id
             )
             functions_record = functions_result.single()
@@ -283,7 +284,7 @@ async def get_repository_metrics(repo_id: str):
 
             # Count classes
             classes_result = session.run(
-                "MATCH (c:Class {repo_id: $repo_id}) RETURN count(c) as count",
+                "MATCH (c:Class) WHERE c.repo_id = $repo_id OR c.job_id = $repo_id RETURN count(c) as count",
                 repo_id=repo_id
             )
             classes_record = classes_result.single()
@@ -291,7 +292,7 @@ async def get_repository_metrics(repo_id: str):
 
             # Count dependencies (edges don't have job_id, count by matching nodes)
             deps_result = session.run(
-                "MATCH (a {repo_id: $repo_id})-[r:CALLS|IMPORTS|INHERITS]->(b {repo_id: $repo_id}) RETURN count(r) as count",
+                "MATCH (a)-[r:CALLS|IMPORTS|INHERITS]->(b) WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) AND (b.repo_id = $repo_id OR b.job_id = $repo_id) RETURN count(r) as count",
                 repo_id=repo_id
             )
             deps_record = deps_result.single()
@@ -345,16 +346,17 @@ async def get_dependency_graph(repo_id: str, limit: int = 100, offset: int = 0):
                 )
 
             # Get total count of nodes
-            total_nodes_query = "MATCH (n {repo_id: $repo_id}) RETURN count(n) as count"
+            total_nodes_query = "MATCH (n) WHERE n.repo_id = $repo_id OR n.job_id = $repo_id RETURN count(n) as count"
             total_nodes = await get_total_count(session, total_nodes_query, repo_id)
 
             # Get total count of edges
-            total_edges_query = "MATCH (a {repo_id: $repo_id})-[r]->(b {repo_id: $repo_id}) RETURN count(r) as count"
+            total_edges_query = "MATCH (a)-[r]->(b) WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) AND (b.repo_id = $repo_id OR b.job_id = $repo_id) RETURN count(r) as count"
             total_edges = await get_total_count(session, total_edges_query, repo_id)
 
             # Get nodes with pagination
             nodes_query = """
-            MATCH (n {repo_id: $repo_id})
+            MATCH (n)
+            WHERE n.repo_id = $repo_id OR n.job_id = $repo_id
             RETURN 
                 COALESCE(n.path, n.name, n.id, toString(id(n))) as id,
                 COALESCE(n.name, n.path, toString(id(n))) as name,
@@ -387,7 +389,8 @@ async def get_dependency_graph(repo_id: str, limit: int = 100, offset: int = 0):
 
             # Get edges with pagination
             edges_query = """
-            MATCH (a {repo_id: $repo_id})-[r]->(b {repo_id: $repo_id})
+            MATCH (a)-[r]->(b)
+            WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) AND (b.repo_id = $repo_id OR b.job_id = $repo_id)
             RETURN 
                 COALESCE(a.path, a.name, a.id, toString(id(a))) as source,
                 COALESCE(b.path, b.name, b.id, toString(id(b))) as target,
@@ -518,7 +521,8 @@ async def calculate_pagerank(repo_id: str):
         # Build NetworkX graph from Neo4j
         with neo4j_driver.session() as session:
             query = """
-            MATCH (a {repo_id: $repo_id})-[r:CALLS|IMPORTS]->(b {repo_id: $repo_id})
+            MATCH (a)-[r:CALLS|IMPORTS]->(b)
+            WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) AND (b.repo_id = $repo_id OR b.job_id = $repo_id)
             RETURN a.id as source, b.id as target
             """
             result = session.run(query, repo_id=repo_id)

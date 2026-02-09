@@ -3,7 +3,7 @@
 //! Builds an in-memory graph from parsed code with symbol resolution
 //! and cross-file dependency tracking.
 
-use crate::parsers::{ClassInfo, FunctionInfo, ParsedFile};
+use crate::parsers::{FunctionInfo, ParsedFile};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================

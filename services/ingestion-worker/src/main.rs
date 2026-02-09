@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AnalysisJob {
@@ -264,7 +264,6 @@ async fn main() -> Result<()> {
 
 /// Clean up temporary repository clones
 async fn cleanup_temp_files() {
-    use std::path::Path;
     use tokio::fs;
     
     let temp_dir = std::env::temp_dir();

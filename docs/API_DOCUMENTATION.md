@@ -2,7 +2,10 @@
 
 ## Overview
 
-The ArchMind API Gateway is a RESTful API built with Go (Gin framework) that provides endpoints for:
+ArchMind consists of two main API services:
+
+### API Gateway (Go/Gin)
+The API Gateway is a RESTful API built with Go (Gin framework) that provides endpoints for:
 - Repository analysis job management
 - Job status tracking
 - Repository management and querying
@@ -10,11 +13,20 @@ The ArchMind API Gateway is a RESTful API built with Go (Gin framework) that pro
 
 The API uses PostgreSQL for persistent storage and Redis for job queue management.
 
-## Base URL
+### Graph Engine (Python/FastAPI)
+The Graph Engine provides graph intelligence and analysis capabilities:
+- Impact analysis for code changes
+- Repository metrics and statistics
+- Dependency graph visualization
+- PageRank analysis for code importance
+- Custom Cypher query execution
 
-```
-http://localhost:8080
-```
+## Base URLs
+
+| Service | URL |
+|---------|-----|
+| API Gateway | `http://localhost:8080` |
+| Graph Engine | `http://localhost:8000` |
 
 ## Environment Configuration
 
@@ -28,6 +40,14 @@ http://localhost:8080
 | `REDIS_PASSWORD` | `` | Redis password (if required) |
 | `GITHUB_WEBHOOK_SECRET` | `` | Secret for verifying GitHub webhook signatures |
 
+### Graph Engine Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI |
+| `NEO4J_USER` | `neo4j` | Neo4j username |
+| `NEO4J_PASSWORD` | `password` | Neo4j password |
+
 ### Example .env file
 
 ```env
@@ -36,9 +56,14 @@ POSTGRES_URL=postgresql://postgres:postgres@localhost:5432/archmind?sslmode=disa
 REDIS_URL=localhost:6379
 REDIS_PASSWORD=
 GITHUB_WEBHOOK_SECRET=your_webhook_secret_here
+
+# Graph Engine
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=password
 ```
 
-## API Endpoints
+## API Gateway Endpoints
 
 ### 1. Health Check
 
@@ -455,7 +480,332 @@ curl http://localhost:8080/api/v1/repositories/1
 
 ---
 
+## Graph Engine Endpoints
+
+The Graph Engine runs on port 8000 and provides graph-based analysis features.
+
+### 1. Graph Engine Root
+
+**Endpoint:** `GET /`
+
+**Description:** Returns basic service information.
+
+**Response:**
+```json
+{
+  "service": "ArchMind Graph Engine",
+  "version": "0.1.0",
+  "status": "running"
+}
+```
+
+**Status Codes:**
+- `200 OK` - Service is running
+
+---
+
+### 2. Graph Engine Health Check
+
+**Endpoint:** `GET /health`
+
+**Description:** Returns the health status of the Graph Engine and Neo4j connection.
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "services": {
+    "neo4j": "healthy"
+  }
+}
+```
+
+**Possible Neo4j Status Values:**
+- `healthy` - Connected and responding
+- `unhealthy` - Connection failed
+- `disconnected` - Not configured
+
+**Status Codes:**
+- `200 OK` - Service is running
+
+**Example cURL:**
+```bash
+curl http://localhost:8000/health
+```
+
+---
+
+### 3. Impact Analysis
+
+**Endpoint:** `GET /api/impact/{node_id}`
+
+**Description:** Analyze the impact of changes to a specific node. Returns all nodes that would be affected if this node changes by following `CALLS`, `IMPORTS`, and `INHERITS` relationships.
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `node_id` | string | The unique identifier of the node to analyze |
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `depth` | integer | `3` | Maximum relationship depth to traverse (1-3) |
+
+**Response:**
+```json
+{
+  "node_id": "src/utils/helper.ts::formatDate",
+  "impacted_count": 5,
+  "impacted_nodes": [
+    {
+      "id": "src/components/DatePicker.tsx::render",
+      "name": "render",
+      "type": "Function",
+      "distance": 1
+    },
+    {
+      "id": "src/views/Dashboard.tsx::Dashboard",
+      "name": "Dashboard",
+      "type": "Class",
+      "distance": 2
+    }
+  ]
+}
+```
+
+**Status Codes:**
+- `200 OK` - Analysis completed
+- `503 Service Unavailable` - Neo4j connection not available
+- `500 Internal Server Error` - Analysis error
+
+**Example cURL:**
+```bash
+curl "http://localhost:8000/api/impact/src%2Futils%2Fhelper.ts%3A%3AformatDate?depth=2"
+```
+
+---
+
+### 4. Repository Metrics
+
+**Endpoint:** `GET /api/metrics/{repo_id}`
+
+**Description:** Calculate and return metrics for a repository. The `repo_id` is the `job_id` from the analysis job.
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `repo_id` | string | The job ID from the analysis job (UUID) |
+
+**Response:**
+```json
+{
+  "total_files": 45,
+  "total_functions": 230,
+  "total_classes": 28,
+  "total_dependencies": 512,
+  "complexity_score": 22.26
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_files` | integer | Number of files in the repository |
+| `total_functions` | integer | Number of functions detected |
+| `total_classes` | integer | Number of classes detected |
+| `total_dependencies` | integer | Number of relationships (CALLS, IMPORTS, INHERITS) |
+| `complexity_score` | float | Calculated complexity score (dependencies/functions * 10) |
+
+**Status Codes:**
+- `200 OK` - Metrics calculated
+- `503 Service Unavailable` - Neo4j connection not available
+- `500 Internal Server Error` - Calculation error
+
+**Example cURL:**
+```bash
+curl http://localhost:8000/api/metrics/550e8400-e29b-41d4-a716-446655440000
+```
+
+---
+
+### 5. Dependency Graph
+
+**Endpoint:** `GET /api/graph/{repo_id}`
+
+**Description:** Retrieve the full dependency graph for a repository for visualization.
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `repo_id` | string | The job ID from the analysis job (UUID) |
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer | `100` | Maximum number of nodes and edges to return |
+
+**Response:**
+```json
+{
+  "nodes": [
+    {
+      "id": "src/index.ts",
+      "label": "index.ts",
+      "type": "File",
+      "properties": {
+        "path": "src/index.ts",
+        "job_id": "550e8400-e29b-41d4-a716-446655440000"
+      }
+    },
+    {
+      "id": "src/utils/helper.ts::formatDate",
+      "label": "formatDate",
+      "type": "Function",
+      "properties": {
+        "name": "formatDate",
+        "job_id": "550e8400-e29b-41d4-a716-446655440000"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "source": "src/index.ts",
+      "target": "src/utils/helper.ts::formatDate",
+      "type": "CALLS"
+    }
+  ]
+}
+```
+
+**Node Types:**
+- `File` - Source code file
+- `Function` - Function or method
+- `Class` - Class definition
+
+**Edge Types:**
+- `CALLS` - Function/method invocation
+- `IMPORTS` - Module/file import
+- `INHERITS` - Class inheritance
+
+**Status Codes:**
+- `200 OK` - Graph retrieved
+- `503 Service Unavailable` - Neo4j connection not available
+- `500 Internal Server Error` - Retrieval error
+
+**Example cURL:**
+```bash
+curl "http://localhost:8000/api/graph/550e8400-e29b-41d4-a716-446655440000?limit=50"
+```
+
+---
+
+### 6. Custom Cypher Query
+
+**Endpoint:** `POST /api/query`
+
+**Description:** Execute a custom Cypher query against the Neo4j database. **Use with caution** - this endpoint allows arbitrary read/write operations.
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | Yes | Cypher query to execute |
+| `params` | object | No | Query parameters as JSON (recommended for security) |
+
+**Response:**
+```json
+{
+  "results": [
+    {"name": "formatDate"},
+    {"name": "parseJSON"},
+    {"name": "validateInput"}
+  ],
+  "count": 3
+}
+```
+
+**Status Codes:**
+- `200 OK` - Query executed
+- `503 Service Unavailable` - Neo4j connection not available
+- `500 Internal Server Error` - Query execution error
+
+**Example cURL:**
+```bash
+curl -X POST "http://localhost:8000/api/query?query=MATCH%20(f:File)%20RETURN%20f.path%20as%20path%20LIMIT%205"
+```
+
+With parameters (URL-encoded JSON):
+```bash
+curl -X POST "http://localhost:8000/api/query?query=MATCH%20(n:Function%20{job_id:%20\$job_id})%20RETURN%20n.name%20LIMIT%2010&params={\"job_id\":\"550e8400-e29b-41d4-a716-446655440000\"}"
+```
+
+---
+
+### 7. PageRank Analysis
+
+**Endpoint:** `GET /api/pagerank/{repo_id}`
+
+**Description:** Calculate PageRank for nodes in the repository graph. This identifies the most important/central functions and classes based on how frequently they are called or imported.
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `repo_id` | string | The job ID from the analysis job (UUID) |
+
+**Response:**
+```json
+{
+  "repo_id": "550e8400-e29b-41d4-a716-446655440000",
+  "total_nodes": 156,
+  "top_nodes": [
+    {
+      "id": "src/utils/logger.ts::log",
+      "score": 0.089234
+    },
+    {
+      "id": "src/db/connection.ts::query",
+      "score": 0.067891
+    },
+    {
+      "id": "src/auth/validate.ts::validateToken",
+      "score": 0.045678
+    }
+  ]
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `repo_id` | string | The repository/job ID |
+| `total_nodes` | integer | Total number of nodes in the graph |
+| `top_nodes` | array | Top 20 nodes by PageRank score |
+| `top_nodes[].id` | string | Node identifier |
+| `top_nodes[].score` | float | PageRank score (higher = more central/important) |
+
+**Status Codes:**
+- `200 OK` - PageRank calculated
+- `503 Service Unavailable` - Neo4j connection not available
+- `500 Internal Server Error` - Calculation error
+
+**Example cURL:**
+```bash
+curl http://localhost:8000/api/pagerank/550e8400-e29b-41d4-a716-446655440000
+```
+
+---
+
 ## CORS Configuration
+
+### API Gateway
 
 The API Gateway has CORS (Cross-Origin Resource Sharing) enabled with the following settings:
 
@@ -469,6 +819,19 @@ The API Gateway has CORS (Cross-Origin Resource Sharing) enabled with the follow
 | Max Age | 12 hours |
 
 To allow additional origins, modify the CORS configuration in `main.go`.
+
+### Graph Engine
+
+The Graph Engine also has CORS enabled:
+
+| Setting | Value |
+|---------|-------|
+| Allowed Origins | `http://localhost:3000` |
+| Allowed Methods | All (`*`) |
+| Allowed Headers | All (`*`) |
+| Credentials | Allowed |
+
+To allow additional origins, modify the CORS configuration in `main.py`.
 
 ---
 
@@ -499,9 +862,11 @@ All API endpoints return standardized error responses:
 
 1. **PostgreSQL** running with the ArchMind schema
 2. **Redis** running on the specified address
-3. **API Gateway** running on port 8080
+3. **Neo4j** running for graph analysis
+4. **API Gateway** running on port 8080
+5. **Graph Engine** running on port 8000
 
-### Test Sequence
+### API Gateway Test Sequence
 
 #### 1. Health Check
 ```bash
@@ -550,6 +915,50 @@ curl http://localhost:8080/api/v1/repositories
 #### 6. Get Specific Repository
 ```bash
 curl http://localhost:8080/api/v1/repositories/1
+```
+
+### Graph Engine Test Sequence
+
+#### 1. Health Check
+```bash
+curl http://localhost:8000/health
+```
+
+Expected response:
+```json
+{
+  "status": "ok",
+  "services": {
+    "neo4j": "healthy"
+  }
+}
+```
+
+#### 2. Get Repository Metrics
+```bash
+curl http://localhost:8000/api/metrics/$JOB_ID
+```
+
+#### 3. Get Dependency Graph
+```bash
+curl "http://localhost:8000/api/graph/$JOB_ID?limit=50"
+```
+
+#### 4. Get Impact Analysis
+```bash
+curl "http://localhost:8000/api/impact/your_node_id?depth=2"
+```
+
+#### 5. Calculate PageRank
+```bash
+curl http://localhost:8000/api/pagerank/$JOB_ID
+```
+
+#### 6. Execute Custom Query
+```bash
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (n) RETURN count(n) as total"}'
 ```
 
 ---
@@ -661,7 +1070,20 @@ cd apps/api-gateway
 go run main.go
 ```
 
-### Dependencies
+### Running the Graph Engine
+
+```bash
+cd services/graph-engine
+pip install -r requirements.txt
+python main.py
+```
+
+Or with uvicorn directly:
+```bash
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### API Gateway Dependencies
 
 The API Gateway uses the following Go packages:
 
@@ -672,12 +1094,24 @@ The API Gateway uses the following Go packages:
 - `github.com/google/uuid` - UUID generation
 - `github.com/joho/godotenv` - Environment variable loading
 
+### Graph Engine Dependencies
+
+The Graph Engine uses the following Python packages:
+
+- `fastapi` - Modern async web framework
+- `uvicorn` - ASGI server
+- `neo4j` - Neo4j Python driver
+- `networkx` - Graph analysis library (for PageRank)
+- `pydantic` - Data validation
+- `python-dotenv` - Environment variable loading
+
 ---
 
 ## Version History
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.1 | 2026-02-03 | Added Graph Engine documentation (impact analysis, metrics, graph retrieval, PageRank, custom queries) |
 | 1.0 | 2026-01-27 | Initial API documentation |
 
 ---

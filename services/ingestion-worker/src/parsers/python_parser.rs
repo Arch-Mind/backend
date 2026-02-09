@@ -1,6 +1,6 @@
 use super::{ClassInfo, FunctionInfo, LanguageParser, ParsedFile};
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
