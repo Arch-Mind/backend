@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
@@ -127,13 +129,240 @@ type AnalyzeRequest struct {
 
 // AnalysisJob represents a job in the queue
 type AnalysisJob struct {
-	JobID     string            `json:"job_id"`
-	RepoID    string            `json:"repo_id"` // Deterministic ID based on RepoURL
-	RepoURL   string            `json:"repo_url"`
-	Branch    string            `json:"branch"`
-	Status    string            `json:"status"`
-	Options   map[string]string `json:"options"`
-	CreatedAt time.Time         `json:"created_at"`
+	JobID       string            `json:"job_id"`
+	RepoID      string            `json:"repo_id"` // Deterministic ID based on RepoURL
+	RepoURL     string            `json:"repo_url"`
+	Branch      string            `json:"branch"`
+	Status      string            `json:"status"`
+	Progress    int               `json:"progress"`    // 0-100
+	Options     map[string]string `json:"options"`
+	CreatedAt   time.Time         `json:"created_at"`
+	subscribers []chan JobUpdate  `json:"-"` // WebSocket subscribers for this job
+}
+
+// JobUpdate represents real-time updates sent via WebSocket
+type JobUpdate struct {
+	Type          string                 `json:"type"` // "progress", "status", "graph_update", "error"
+	JobID         string                 `json:"job_id,omitempty"`
+	RepoID        string                 `json:"repo_id,omitempty"`
+	Status        string                 `json:"status,omitempty"`
+	Progress      int                    `json:"progress,omitempty"`
+	Message       string                 `json:"message,omitempty"`
+	Error         string                 `json:"error,omitempty"`
+	ChangedNodes  []string               `json:"changed_nodes,omitempty"`
+	ChangedEdges  []string               `json:"changed_edges,omitempty"`
+	ResultSummary map[string]interface{} `json:"result_summary,omitempty"`
+	Timestamp     time.Time              `json:"timestamp"`
+}
+
+// WebSocketClient represents a connected WebSocket client
+type WebSocketClient struct {
+	conn     *websocket.Conn
+	send     chan JobUpdate
+	hub      *WebSocketHub
+	jobID    string // For job-specific connections
+	repoID   string // For repo-specific connections
+	clientID string
+}
+
+// WebSocketHub manages WebSocket connections and message broadcasting
+type WebSocketHub struct {
+	clients    map[string]*WebSocketClient // clientID -> client
+	jobClients map[string]map[string]bool  // jobID -> set of clientIDs
+	repoClients map[string]map[string]bool // repoID -> set of clientIDs
+	broadcast  chan JobUpdate
+	register   chan *WebSocketClient
+	unregister chan *WebSocketClient
+	mu         sync.RWMutex
+}
+
+// WebSocket upgrader
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		// Allow all origins for development - in production, restrict this
+		return true
+	},
+}
+
+// NewWebSocketHub creates a new WebSocket hub
+func NewWebSocketHub() *WebSocketHub {
+	return &WebSocketHub{
+		clients:     make(map[string]*WebSocketClient),
+		jobClients:  make(map[string]map[string]bool),
+		repoClients: make(map[string]map[string]bool),
+		broadcast:   make(chan JobUpdate, 256),
+		register:    make(chan *WebSocketClient),
+		unregister:  make(chan *WebSocketClient),
+	}
+}
+
+// Run starts the WebSocket hub
+func (h *WebSocketHub) Run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client.clientID] = client
+			
+			// Register for job-specific updates
+			if client.jobID != "" {
+				if h.jobClients[client.jobID] == nil {
+					h.jobClients[client.jobID] = make(map[string]bool)
+				}
+				h.jobClients[client.jobID][client.clientID] = true
+				log.Printf("🔌 WebSocket client %s registered for job %s", client.clientID, client.jobID)
+			}
+			
+			// Register for repo-specific updates
+			if client.repoID != "" {
+				if h.repoClients[client.repoID] == nil {
+					h.repoClients[client.repoID] = make(map[string]bool)
+				}
+				h.repoClients[client.repoID][client.clientID] = true
+				log.Printf("🔌 WebSocket client %s registered for repo %s", client.clientID, client.repoID)
+			}
+			h.mu.Unlock()
+
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if _, ok := h.clients[client.clientID]; ok {
+				delete(h.clients, client.clientID)
+				close(client.send)
+				
+				// Unregister from job-specific updates
+				if client.jobID != "" {
+					delete(h.jobClients[client.jobID], client.clientID)
+					if len(h.jobClients[client.jobID]) == 0 {
+						delete(h.jobClients, client.jobID)
+					}
+				}
+				
+				// Unregister from repo-specific updates
+				if client.repoID != "" {
+					delete(h.repoClients[client.repoID], client.clientID)
+					if len(h.repoClients[client.repoID]) == 0 {
+						delete(h.repoClients, client.repoID)
+					}
+				}
+				
+				log.Printf("🔌 WebSocket client %s disconnected", client.clientID)
+			}
+			h.mu.Unlock()
+
+		case update := <-h.broadcast:
+			h.mu.RLock()
+			var targetClients []*WebSocketClient
+			
+			// Determine which clients should receive this update
+			if update.JobID != "" {
+				// Send to clients subscribed to this job
+				for clientID := range h.jobClients[update.JobID] {
+					if client, ok := h.clients[clientID]; ok {
+						targetClients = append(targetClients, client)
+					}
+				}
+			}
+			
+			if update.RepoID != "" {
+				// Send to clients subscribed to this repo
+				for clientID := range h.repoClients[update.RepoID] {
+					if client, ok := h.clients[clientID]; ok {
+						// Avoid duplicates
+						isDuplicate := false
+						for _, tc := range targetClients {
+							if tc.clientID == clientID {
+								isDuplicate = true
+								break
+							}
+						}
+						if !isDuplicate {
+							targetClients = append(targetClients, client)
+						}
+					}
+				}
+			}
+			h.mu.RUnlock()
+			
+			// Send update to target clients
+			for _, client := range targetClients {
+				select {
+				case client.send <- update:
+				default:
+					// Client send buffer is full, disconnect them
+					h.mu.Lock()
+					close(client.send)
+					delete(h.clients, client.clientID)
+					h.mu.Unlock()
+				}
+			}
+		}
+	}
+}
+
+// BroadcastJobUpdate sends an update to all clients subscribed to a job
+func (h *WebSocketHub) BroadcastJobUpdate(update JobUpdate) {
+	update.Timestamp = time.Now()
+	h.broadcast <- update
+}
+
+// readPump handles incoming messages from the WebSocket connection
+func (c *WebSocketClient) readPump() {
+	defer func() {
+		c.hub.unregister <- c
+		c.conn.Close()
+	}()
+	
+	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+	
+	for {
+		_, _, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("⚠️  WebSocket error: %v", err)
+			}
+			break
+		}
+	}
+}
+
+// writePump sends messages from the hub to the WebSocket connection
+func (c *WebSocketClient) writePump() {
+	ticker := time.NewTicker(54 * time.Second)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+	
+	for {
+		select {
+		case update, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if !ok {
+				// Channel closed, disconnect
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			
+			// Send JSON update
+			if err := c.conn.WriteJSON(update); err != nil {
+				log.Printf("⚠️  Error writing to WebSocket: %v", err)
+				return
+			}
+			
+		case <-ticker.C:
+			// Send ping to keep connection alive
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // JobResponse represents the response after creating a job
@@ -164,6 +393,7 @@ type JobUpdateResponse struct {
 var (
 	redisClient *redis.Client
 	db          *sql.DB
+	wsHub       *WebSocketHub
 	ctx         = context.Background()
 )
 
@@ -178,6 +408,11 @@ func main() {
 
 	// Initialize PostgreSQL connection
 	initPostgres()
+
+	// Initialize WebSocket Hub
+	wsHub = NewWebSocketHub()
+	go wsHub.Run()
+	log.Println("🔌 WebSocket Hub initialized")
 
 	// Initialize Gin router
 	router := setupRouter()
@@ -322,6 +557,13 @@ func setupRouter() *gin.Engine {
 	// Health check
 	router.GET("/health", healthCheck)
 
+	// WebSocket endpoints
+	ws := router.Group("/ws")
+	{
+		ws.GET("/analysis/:job_id", handleJobWebSocket)
+		ws.GET("/repo/:repo_id", handleRepoWebSocket)
+	}
+
 	// Webhooks (no auth required, uses signature verification)
 	webhooks := router.Group("/webhooks")
 	{
@@ -367,6 +609,80 @@ func healthCheck(c *gin.Context) {
 		},
 		"timestamp": time.Now().UTC(),
 	})
+}
+
+// handleJobWebSocket handles WebSocket connections for job-specific updates
+func handleJobWebSocket(c *gin.Context) {
+	jobID := c.Param("job_id")
+	
+	// Validate job ID
+	if !validateUUID(jobID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid job ID"})
+		return
+	}
+	
+	// Upgrade HTTP connection to WebSocket
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Printf("⚠️  Failed to upgrade WebSocket: %v", err)
+		return
+	}
+	
+	// Create client
+	clientID := uuid.New().String()
+	client := &WebSocketClient{
+		conn:     conn,
+		send:     make(chan JobUpdate, 256),
+		hub:      wsHub,
+		jobID:    jobID,
+		clientID: clientID,
+	}
+	
+	// Register client
+	wsHub.register <- client
+	
+	// Start goroutines for reading and writing
+	go client.writePump()
+	go client.readPump()
+	
+	log.Printf("✅ WebSocket connection established for job %s (client: %s)", jobID, clientID)
+}
+
+// handleRepoWebSocket handles WebSocket connections for repository-specific updates
+func handleRepoWebSocket(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	
+	// Validate repo ID
+	if !validateUUID(repoID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid repository ID"})
+		return
+	}
+	
+	// Upgrade HTTP connection to WebSocket
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Printf("⚠️  Failed to upgrade WebSocket: %v", err)
+		return
+	}
+	
+	// Create client
+	clientID := uuid.New().String()
+	client := &WebSocketClient{
+		conn:     conn,
+		send:     make(chan JobUpdate, 256),
+		hub:      wsHub,
+		repoID:   repoID,
+		clientID: clientID,
+	}
+	
+	// Register client
+	wsHub.register <- client
+	
+	// Start goroutines for reading and writing
+	go client.writePump()
+	go client.readPump()
+	
+	log.Printf("✅ WebSocket connection established for repo %s (client: %s)", repoID, clientID)
 }
 
 // generateRepoID generates a deterministic UUID v5 based on the repository URL
@@ -574,6 +890,34 @@ func updateJob(c *gin.Context) {
 	if req.Status != nil {
 		finalStatus = *req.Status
 	}
+
+	// Get repo_id for WebSocket broadcast
+	var repoID string
+	db.QueryRow("SELECT repo_id FROM analysis_jobs WHERE job_id = $1", jobID).Scan(&repoID)
+
+	// Broadcast update via WebSocket
+	update := JobUpdate{
+		Type:          "progress",
+		JobID:         jobID,
+		RepoID:        repoID,
+		Status:        finalStatus,
+		Progress:      0,
+		ResultSummary: req.ResultSummary,
+		Timestamp:     time.Now(),
+	}
+	
+	if req.Progress != nil {
+		update.Progress = *req.Progress
+	}
+	
+	if req.Error != nil {
+		update.Type = "error"
+		update.Error = *req.Error
+	} else if finalStatus == "COMPLETED" || finalStatus == "FAILED" {
+		update.Type = "status"
+	}
+	
+	wsHub.BroadcastJobUpdate(update)
 
 	log.Printf("📝 Updated job %s: status=%s", jobID, finalStatus)
 
