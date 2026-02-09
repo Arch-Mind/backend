@@ -5,6 +5,8 @@
 
 use crate::graph_builder::{DependencyGraph, EdgeType, NodeId};
 use crate::parsers::{FunctionInfo, ParsedFile};
+use crate::git_analyzer::RepoContributions;
+use crate::boundary_detector::BoundaryDetectionResult;
 use anyhow::{Context, Result};
 use neo4rs::query;
 use std::collections::HashMap;
@@ -98,6 +100,8 @@ pub async fn store_graph(
     repo_id: &str,
     parsed_files: &[ParsedFile],
     dep_graph: &DependencyGraph,
+    git_contributions: Option<&RepoContributions>,
+    boundary_result: &BoundaryDetectionResult,
     config: Option<BatchConfig>,
 ) -> Result<()> {
     let config = config.unwrap_or_default();
@@ -107,7 +111,16 @@ pub async fn store_graph(
     let mut txn = graph_db.start_txn().await.context("Failed to start transaction")?;
 
     // Execute batch operations with error handling
-    let result = execute_batch_operations(&mut txn, job_id, repo_id, parsed_files, dep_graph, &config).await;
+    let result = execute_batch_operations(
+        &mut txn, 
+        job_id, 
+        repo_id, 
+        parsed_files, 
+        dep_graph, 
+        git_contributions,
+        boundary_result,
+        &config
+    ).await;
 
     match result {
         Ok(_) => {
@@ -129,23 +142,29 @@ async fn execute_batch_operations(
     repo_id: &str,
     parsed_files: &[ParsedFile],
     dep_graph: &DependencyGraph,
+    git_contributions: Option<&RepoContributions>,
+    boundary_result: &BoundaryDetectionResult,
     config: &BatchConfig,
 ) -> Result<()> {
     // 1. Create Job node
     create_job_node(txn, job_id, repo_id).await?;
 
     // 2. Batch insert nodes
-    batch_insert_file_nodes(txn, job_id, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_file_nodes(txn, job_id, repo_id, parsed_files, git_contributions, config.batch_size).await?;
     batch_insert_class_nodes(txn, job_id, repo_id, parsed_files, config.batch_size).await?;
     batch_insert_function_nodes(txn, job_id, repo_id, parsed_files, config.batch_size).await?;
     batch_insert_module_nodes(txn, job_id, repo_id, dep_graph, config.batch_size).await?;
+    
+    // 3. Batch insert boundaries
+    batch_insert_boundary_nodes(txn, job_id, repo_id, boundary_result, config.batch_size).await?;
 
-    // 3. Batch insert edges
+    // 4. Batch insert edges
     batch_insert_defines_edges(txn, repo_id, dep_graph, config.batch_size).await?;
     batch_insert_contains_edges(txn, repo_id, dep_graph, config.batch_size).await?;
     batch_insert_calls_edges(txn, repo_id, dep_graph, config.batch_size).await?;
     batch_insert_imports_edges(txn, repo_id, dep_graph, config.batch_size).await?;
     batch_insert_inherits_edges(txn, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_belongs_to_edges(txn, repo_id, boundary_result, config.batch_size).await?;
 
     Ok(())
 }
@@ -175,11 +194,40 @@ async fn batch_insert_file_nodes(
     job_id: &str,
     repo_id: &str,
     parsed_files: &[ParsedFile],
+    git_contributions: Option<&RepoContributions>,
     batch_size: usize,
 ) -> Result<()> {
-    let nodes: Vec<BoltMap> = parsed_files
+    let nodes: Vec<HashMap<String, neo4rs::BoltType>> = parsed_files
         .iter()
-        .map(|f| file_node_to_map(&f.path, &f.language, job_id, repo_id))
+        .map(|f| {
+            let mut m: HashMap<String, neo4rs::BoltType> = HashMap::new();
+            m.insert("id".to_string(), f.path.clone().into());
+            m.insert("path".to_string(), f.path.clone().into());
+            m.insert("language".to_string(), f.language.clone().into());
+            m.insert("job_id".to_string(), job_id.to_string().into());
+            m.insert("repo_id".to_string(), repo_id.to_string().into());
+            
+            // Add git metrics if available
+            if let Some(contributions) = git_contributions {
+                if let Some(file_contrib) = contributions.files.get(&f.path) {
+                    m.insert("commit_count".to_string(), (file_contrib.commit_count as i64).into());
+                    m.insert("last_commit_date".to_string(), 
+                             file_contrib.last_modified.to_rfc3339().into());
+                    m.insert("primary_author".to_string(), 
+                             file_contrib.primary_author.clone().into());
+                    m.insert("lines_changed_total".to_string(), 
+                             (file_contrib.lines_changed_total as i64).into());
+                    
+                    let contributors: Vec<String> = file_contrib.contributors
+                        .iter()
+                        .map(|c| c.email.clone())
+                        .collect();
+                    m.insert("contributors".to_string(), contributors.into());
+                }
+            }
+            
+            m
+        })
         .collect();
 
     for chunk in nodes.chunks(batch_size) {
@@ -189,7 +237,12 @@ async fn batch_insert_file_nodes(
              SET f.path = node.path,
                  f.language = node.language,
                  f.job_id = node.job_id,
-                 f.repo_id = node.repo_id"
+                 f.repo_id = node.repo_id,
+                 f.commit_count = COALESCE(node.commit_count, 0),
+                 f.last_commit_date = COALESCE(node.last_commit_date, ''),
+                 f.primary_author = COALESCE(node.primary_author, ''),
+                 f.lines_changed_total = COALESCE(node.lines_changed_total, 0),
+                 f.contributors = COALESCE(node.contributors, [])"
         )
         .param("nodes", chunk.to_vec());
         
@@ -573,6 +626,92 @@ async fn batch_insert_inherits_edges(
     }
     
     info!("   Created {} INHERITS edges", class_to_class.len() + class_to_module.len());
+    Ok(())
+}
+
+// ============================================================================
+// Boundary Nodes and Edges
+// ============================================================================
+
+async fn batch_insert_boundary_nodes(
+    txn: &mut neo4rs::Txn,
+    job_id: &str,
+    repo_id: &str,
+    boundary_result: &BoundaryDetectionResult,
+    batch_size: usize,
+) -> Result<()> {
+    let nodes: Vec<HashMap<String, neo4rs::BoltType>> = boundary_result.boundaries
+        .iter()
+        .map(|b| {
+            let mut m: HashMap<String, neo4rs::BoltType> = HashMap::new();
+            m.insert("id".to_string(), b.id.clone().into());
+            m.insert("name".to_string(), b.name.clone().into());
+            m.insert("type".to_string(), b.boundary_type.as_str().to_string().into());
+            m.insert("path".to_string(), b.path.clone().into());
+            m.insert("job_id".to_string(), job_id.to_string().into());
+            m.insert("repo_id".to_string(), repo_id.to_string().into());
+            m.insert("file_count".to_string(), (b.file_count as i64).into());
+            
+            if let Some(layer) = &b.layer {
+                m.insert("layer".to_string(), layer.as_str().to_string().into());
+            }
+            
+            m
+        })
+        .collect();
+
+    for chunk in nodes.chunks(batch_size) {
+        let q = query(
+            "UNWIND $nodes AS node
+             MERGE (b:Boundary {id: node.id})
+             SET b.name = node.name,
+                 b.type = node.type,
+                 b.path = node.path,
+                 b.job_id = node.job_id,
+                 b.repo_id = node.repo_id,
+                 b.file_count = node.file_count,
+                 b.layer = COALESCE(node.layer, '')"
+        )
+        .param("nodes", chunk.to_vec());
+        
+        txn.run(q).await.context("Failed to batch insert boundary nodes")?;
+    }
+    
+    info!("   Inserted {} Boundary nodes", nodes.len());
+    Ok(())
+}
+
+async fn batch_insert_belongs_to_edges(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    boundary_result: &BoundaryDetectionResult,
+    batch_size: usize,
+) -> Result<()> {
+    let mut edges = Vec::new();
+    
+    for boundary in &boundary_result.boundaries {
+        for file_path in &boundary.files {
+            let mut m = HashMap::new();
+            m.insert("file_id".to_string(), file_path.clone());
+            m.insert("boundary_id".to_string(), boundary.id.clone());
+            m.insert("repo_id".to_string(), repo_id.to_string());
+            edges.push(m);
+        }
+    }
+
+    for chunk in edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (f:File {id: edge.file_id, repo_id: edge.repo_id})
+             MATCH (b:Boundary {id: edge.boundary_id, repo_id: edge.repo_id})
+             MERGE (f)-[:BELONGS_TO]->(b)"
+        )
+        .param("edges", chunk.to_vec());
+        
+        txn.run(q).await.context("Failed to batch insert BELONGS_TO edges")?;
+    }
+    
+    info!("   Created {} BELONGS_TO edges", edges.len());
     Ok(())
 }
 

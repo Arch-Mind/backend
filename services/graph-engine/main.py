@@ -508,6 +508,114 @@ async def create_indexes():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/graph/{repo_id}/contributions")
+async def get_file_contributions(repo_id: str):
+    """
+    Get git contribution metrics for all files in the repository.
+    Returns commit counts, primary authors, and contributor information per file.
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+
+    try:
+        with neo4j_driver.session() as session:
+            query = """
+            MATCH (f:File)
+            WHERE f.repo_id = $repo_id
+            RETURN f.id as file_path,
+                   f.commit_count as commit_count,
+                   f.last_commit_date as last_commit_date,
+                   f.primary_author as primary_author,
+                   f.lines_changed_total as lines_changed_total,
+                   f.contributors as contributors,
+                   f.language as language
+            ORDER BY f.commit_count DESC
+            """
+            result = session.run(query, repo_id=repo_id)
+            
+            contributions = []
+            for record in result:
+                contributions.append({
+                    "file_path": record["file_path"],
+                    "commit_count": record["commit_count"] or 0,
+                    "last_commit_date": record["last_commit_date"],
+                    "primary_author": record["primary_author"] or "",
+                    "lines_changed_total": record["lines_changed_total"] or 0,
+                    "contributors": record["contributors"] or [],
+                    "contributor_count": len(record["contributors"] or []),
+                    "language": record["language"]
+                })
+            
+            logger.info(f"📊 Retrieved contributions for {len(contributions)} files in repo {repo_id}")
+            return {
+                "repo_id": repo_id,
+                "total_files": len(contributions),
+                "contributions": contributions
+            }
+    except Exception as e:
+        logger.error(f"Error retrieving file contributions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/graph/{repo_id}/boundaries")
+async def get_module_boundaries(repo_id: str, boundary_type: Optional[str] = None):
+    """
+    Get detected module boundaries in the repository.
+    
+    Query Parameters:
+        boundary_type: Filter by type (physical, logical, architectural)
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+
+    try:
+        with neo4j_driver.session() as session:
+            # Build query based on filters
+            where_clause = "b.repo_id = $repo_id"
+            params = {"repo_id": repo_id}
+            
+            if boundary_type:
+                where_clause += " AND b.type = $boundary_type"
+                params["boundary_type"] = boundary_type
+            
+            query = f"""
+            MATCH (b:Boundary)
+            WHERE {where_clause}
+            OPTIONAL MATCH (f:File)-[:BELONGS_TO]->(b)
+            RETURN b.id as id,
+                   b.name as name,
+                   b.type as type,
+                   b.path as path,
+                   b.layer as layer,
+                   b.file_count as file_count,
+                   collect(f.id) as files
+            ORDER BY b.type, b.name
+            """
+            result = session.run(query, **params)
+            
+            boundaries = []
+            for record in result:
+                boundaries.append({
+                    "id": record["id"],
+                    "name": record["name"],
+                    "type": record["type"],
+                    "path": record["path"],
+                    "layer": record["layer"],
+                    "file_count": record["file_count"],
+                    "files": [f for f in record["files"] if f]  # Filter out nulls
+                })
+            
+            logger.info(f"🗺️  Retrieved {len(boundaries)} boundaries in repo {repo_id}")
+            return {
+                "repo_id": repo_id,
+                "total_boundaries": len(boundaries),
+                "boundaries": boundaries
+            }
+    except Exception as e:
+        logger.error(f"Error retrieving module boundaries: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/pagerank/{repo_id}")
 async def calculate_pagerank(repo_id: str):
     """

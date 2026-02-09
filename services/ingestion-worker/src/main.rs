@@ -1,6 +1,8 @@
 mod graph_builder;
 mod neo4j_storage;
 mod parsers;
+mod git_analyzer;
+mod boundary_detector;
 
 use anyhow::{Context, Result};
 use parsers::{
@@ -428,7 +430,43 @@ async fn analyze_repository(
           symbol_table.functions.len(), 
           symbol_table.classes.len());
 
-    // Step 4: Build dependency graph
+    // Step 4: Analyze git commit history
+    let git_contributions = match git_analyzer::GitAnalyzer::new(&temp_repo.path) {
+        Ok(analyzer) => {
+            match analyzer.analyze_contributions() {
+                Ok(contributions) => {
+                    info!("📊 Analyzed git history: {} files with {} total commits", 
+                          contributions.files.len(), 
+                          contributions.total_commits);
+                    Some(contributions)
+                }
+                Err(e) => {
+                    warn!("⚠️  Failed to analyze git history: {}. Continuing without git metrics.", e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            warn!("⚠️  Failed to open git repository: {}. Continuing without git metrics.", e);
+            None
+        }
+    };
+
+    // Step 5: Detect module boundaries
+    let boundary_result = boundary_detector::BoundaryDetector::detect_boundaries(&parsed_files, &temp_repo.path)?;
+    info!("🗺️  Detected {} module boundaries", boundary_result.boundaries.len());
+
+    // Update progress: 60%
+    if let Err(e) = api_client.update_job(&job.job_id, JobUpdatePayload {
+        status: None,
+        progress: Some(60),
+        result_summary: None,
+        error: None,
+    }).await {
+        error!("Failed to update progress to 60%: {:?}", e);
+    }
+
+    // Step 6: Build dependency graph
     let dep_graph = graph_builder::DependencyGraph::from_parsed_files(&parsed_files, &symbol_table);
     let stats = dep_graph.stats();
     info!("🔗 Built dependency graph: {} nodes, {} edges", 
@@ -445,8 +483,17 @@ async fn analyze_repository(
         error!("Failed to update progress to 75%: {:?}", e);
     }
 
-    // Step 5: Store in Neo4j (batch operations with transactions)
-    neo4j_storage::store_graph(neo4j_graph, &job.job_id, &job.repo_id, &parsed_files, &dep_graph, None).await?;
+    // Step 7: Store in Neo4j (batch operations with transactions)
+    neo4j_storage::store_graph(
+        neo4j_graph, 
+        &job.job_id, 
+        &job.repo_id, 
+        &parsed_files, 
+        &dep_graph, 
+        git_contributions.as_ref(),
+        &boundary_result,
+        None
+    ).await?;
     info!("💾 Stored graph data in Neo4j (batch mode)");
 
     // Update progress: 90%
