@@ -8,7 +8,16 @@ from dotenv import load_dotenv
 from neo4j import GraphDatabase
 import networkx as nx
 import logging
-import boto3
+import psycopg2
+from datetime import datetime, timedelta
+
+from llm_service import (
+    LLMSettings,
+    call_llm,
+    build_pattern_prompt,
+    build_module_summary_prompt,
+    parse_json_response,
+)
 
 # Load environment variables
 load_dotenv()
@@ -37,6 +46,7 @@ app.add_middleware(
 neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 neo4j_user = os.getenv("NEO4J_USER", "neo4j")
 neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
+postgres_url = os.getenv("POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/archmind")
 
 
 def connect_neo4j_with_retry(uri: str, user: str, password: str, max_retries: int = 4):
@@ -152,62 +162,64 @@ async def check_repo_exists(session, repo_id: str) -> bool:
         return False
 
 
-def call_bedrock_claude(prompt: str) -> str:
-    model_id = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0")
-    region = os.getenv("AWS_REGION", "us-east-1")
+def get_postgres_connection():
+    return psycopg2.connect(postgres_url)
 
-    client = boto3.client("bedrock-runtime", region_name=region)
-    payload = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 900,
-        "temperature": 0.2,
-        "messages": [
+
+def read_cached_insights(repo_id: str) -> Optional[Dict]:
+    ttl = datetime.utcnow() - timedelta(hours=24)
+    query = """
+    SELECT pattern_type, confidence, summary, generated_at
+    FROM architecture_insights
+    WHERE repo_id = %s AND generated_at >= %s
+    ORDER BY generated_at DESC
+    """
+
+    with get_postgres_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (repo_id, ttl))
+            rows = cur.fetchall()
+
+    if not rows:
+        return None
+
+    return {
+        "repo_id": repo_id,
+        "generated_at": rows[0][3].isoformat(),
+        "insights": [
             {
-                "role": "user",
-                "content": prompt,
+                "pattern_type": row[0],
+                "confidence": row[1],
+                "summary": row[2],
+                "generated_at": row[3].isoformat(),
             }
+            for row in rows
         ],
     }
 
-    response = client.invoke_model(
-        modelId=model_id,
-        body=json.dumps(payload),
-        accept="application/json",
-        contentType="application/json",
-    )
 
-    body = response.get("body")
-    if hasattr(body, "read"):
-        body = body.read()
+def store_insights(repo_id: str, insights: List[Dict]) -> None:
+    query = """
+    INSERT INTO architecture_insights (repo_id, pattern_type, confidence, summary, generated_at)
+    VALUES (%s, %s, %s, %s, %s)
+    """
 
-    data = json.loads(body)
-    content = data.get("content", [])
-    if isinstance(content, list) and content:
-        return content[0].get("text", "").strip()
+    with get_postgres_connection() as conn:
+        with conn.cursor() as cur:
+            for insight in insights:
+                cur.execute(
+                    query,
+                    (
+                        repo_id,
+                        insight.get("pattern_type"),
+                        insight.get("confidence"),
+                        insight.get("summary", ""),
+                        insight.get("generated_at", datetime.utcnow()),
+                    ),
+                )
+        conn.commit()
 
-    return data.get("completion", "").strip()
 
-
-def build_architecture_prompt(repo_id: str, metrics: Dict, endpoints: List[Dict], queues: List[Dict], rpc_services: List[Dict]) -> str:
-    prompt = [
-        "You are an architecture analysis assistant.",
-        f"Repository ID: {repo_id}",
-        "Summarize module boundaries, key dependencies, and communication paths.",
-        "Provide risks and suggestions for refactoring.",
-        "",
-        "Metrics:",
-        json.dumps(metrics, indent=2),
-        "",
-        "HTTP Endpoints:",
-        json.dumps(endpoints[:20], indent=2),
-        "",
-        "Message Queues:",
-        json.dumps(queues[:20], indent=2),
-        "",
-        "RPC Services:",
-        json.dumps(rpc_services[:20], indent=2),
-    ]
-    return "\n".join(prompt)
 
 
 async def get_total_count(session, query: str, repo_id: str) -> int:
@@ -900,90 +912,108 @@ async def get_communication(repo_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/graph/{repo_id}/analysis")
-async def get_architecture_analysis(repo_id: str, refresh: bool = False):
+@app.post("/api/analyze/{repo_id}/architecture")
+async def analyze_architecture(repo_id: str, refresh: bool = False):
     """
-    Generate or retrieve architecture analysis using AWS Bedrock.
+    Trigger architecture analysis and store insights in Postgres.
     """
     if not neo4j_driver:
         raise HTTPException(status_code=503, detail="Neo4j connection not available")
 
+    if not refresh:
+        cached = read_cached_insights(repo_id)
+        if cached:
+            return {"cached": True, **cached}
+
     try:
         with neo4j_driver.session() as session:
-            if not refresh:
-                existing = session.run(
-                    "MATCH (a:ArchitectureAnalysis {repo_id: $repo_id}) RETURN a.summary as summary, a.model as model, a.created_at as created_at LIMIT 1",
-                    repo_id=repo_id,
-                ).single()
-
-                if existing and existing.get("summary"):
-                    return {
-                        "repo_id": repo_id,
-                        "model": existing.get("model"),
-                        "summary": existing.get("summary"),
-                        "created_at": str(existing.get("created_at")),
-                        "cached": True,
-                    }
-
-            metrics_query = """
-            MATCH (n)
-            WHERE (n.repo_id = $repo_id OR n.job_id = $repo_id)
-            RETURN
-                sum(CASE WHEN n:File THEN 1 ELSE 0 END) as files,
-                sum(CASE WHEN n:Class THEN 1 ELSE 0 END) as classes,
-                sum(CASE WHEN n:Function THEN 1 ELSE 0 END) as functions,
-                sum(CASE WHEN n:Endpoint THEN 1 ELSE 0 END) as endpoints,
-                sum(CASE WHEN n:RpcService THEN 1 ELSE 0 END) as rpc_services,
-                sum(CASE WHEN n:MessageQueue THEN 1 ELSE 0 END) as queues,
-                sum(CASE WHEN n:ComposeService THEN 1 ELSE 0 END) as compose_services
+            boundaries_query = """
+            MATCH (b:Boundary)
+            WHERE b.repo_id = $repo_id
+            OPTIONAL MATCH (f:File)-[:BELONGS_TO]->(b)
+            RETURN b.name as name, b.type as type, collect(f.path) as files
             """
+            boundaries = [dict(record) for record in session.run(boundaries_query, repo_id=repo_id)]
 
-            metrics_record = session.run(metrics_query, repo_id=repo_id).single()
-            metrics = dict(metrics_record) if metrics_record else {}
+            deps_query = """
+            MATCH (a)-[r]->(b)
+            WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id)
+            RETURN type(r) as type, count(*) as count
+            """
+            dep_counts = [dict(record) for record in session.run(deps_query)]
 
-            endpoints = [
-                dict(record)
-                for record in session.run(
-                    "MATCH (e:Endpoint {repo_id: $repo_id}) RETURN e.url as url, e.method as method, e.host as host LIMIT 50",
-                    repo_id=repo_id,
-                )
-            ]
-
-            queues = [
-                dict(record)
-                for record in session.run(
-                    "MATCH (q:MessageQueue {repo_id: $repo_id}) RETURN q.topic as topic LIMIT 50",
-                    repo_id=repo_id,
-                )
-            ]
-
-            rpc_services = [
-                dict(record)
-                for record in session.run(
-                    "MATCH (r:RpcService {repo_id: $repo_id}) RETURN r.name as name LIMIT 50",
-                    repo_id=repo_id,
-                )
-            ]
-
-            prompt = build_architecture_prompt(repo_id, metrics, endpoints, queues, rpc_services)
-            summary = call_bedrock_claude(prompt)
-
-            session.run(
-                "MERGE (a:ArchitectureAnalysis {repo_id: $repo_id}) SET a.summary = $summary, a.model = $model, a.created_at = datetime()",
+            files_count = session.run(
+                "MATCH (f:File) WHERE f.repo_id = $repo_id OR f.job_id = $repo_id RETURN count(f) as count",
                 repo_id=repo_id,
-                summary=summary,
-                model=os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"),
+            ).single()
+
+            summary = {
+                "repo_id": repo_id,
+                "file_count": files_count["count"] if files_count else 0,
+                "boundaries": boundaries,
+                "dependency_types": dep_counts,
+            }
+
+            settings = LLMSettings.from_env()
+            pattern_prompt = build_pattern_prompt(summary)
+            pattern_resp = parse_json_response(call_llm(pattern_prompt, settings))
+
+            insights = []
+            insights.append(
+                {
+                    "pattern_type": pattern_resp.get("pattern_type", "unknown"),
+                    "confidence": pattern_resp.get("confidence"),
+                    "summary": pattern_resp.get("summary", ""),
+                    "generated_at": datetime.utcnow(),
+                }
             )
 
+            for boundary in boundaries:
+                module_name = boundary.get("name") or "unknown"
+                files = boundary.get("files", [])
+
+                deps = session.run(
+                    """
+                    MATCH (f:File)-[r]->(t)
+                    WHERE f.path IN $files AND (f.repo_id = $repo_id OR f.job_id = $repo_id)
+                    RETURN f.path as source, type(r) as relationship, labels(t)[0] as target_type, coalesce(t.name, t.path) as target
+                    """,
+                    repo_id=repo_id,
+                    files=files,
+                )
+                deps_list = [dict(record) for record in deps]
+
+                module_prompt = build_module_summary_prompt(module_name, files, deps_list)
+                module_resp = parse_json_response(call_llm(module_prompt, settings))
+
+                insights.append(
+                    {
+                        "pattern_type": f"module_summary:{module_name}",
+                        "confidence": None,
+                        "summary": module_resp.get("summary", ""),
+                        "generated_at": datetime.utcnow(),
+                    }
+                )
+
+            store_insights(repo_id, insights)
+
             return {
-                "repo_id": repo_id,
-                "model": os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"),
-                "summary": summary,
                 "cached": False,
+                "repo_id": repo_id,
+                "insights": insights,
             }
     except Exception as e:
-        logger.error(f"Error retrieving architecture analysis: {e}")
+        logger.error(f"Error analyzing architecture: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/analyze/{repo_id}/architecture")
+async def get_architecture_insights(repo_id: str):
+    cached = read_cached_insights(repo_id)
+    if cached:
+        return {"cached": True, **cached}
+
+    raise HTTPException(status_code=404, detail="No cached architecture insights found")
 
 
 @app.get("/api/graph/{repo_id}/dependency-tree/{file_path:path}")
