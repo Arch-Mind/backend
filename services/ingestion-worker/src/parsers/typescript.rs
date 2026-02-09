@@ -1,5 +1,7 @@
 use super::{ClassInfo, FunctionInfo, LanguageParser, ParsedFile};
+use super::{InheritanceInfo, ServiceCall};
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
@@ -9,6 +11,50 @@ pub struct TypeScriptParser;
 impl TypeScriptParser {
     pub fn new() -> Result<Self> {
         Ok(TypeScriptParser)
+    }
+
+    fn extract_data_tables(&self, content: &str) -> Vec<String> {
+        let mut tables = HashSet::new();
+        let patterns = [
+            r"(?i)\bfrom\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\bjoin\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\binto\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\bupdate\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\bdelete\s+from\s+([a-zA-Z0-9_.]+)",
+            r#"(?i)\btable\(\s*['"]([a-zA-Z0-9_.]+)['"]"#,
+        ];
+
+        for pattern in patterns {
+            if let Ok(re) = Regex::new(pattern) {
+                for cap in re.captures_iter(content) {
+                    if let Some(m) = cap.get(1) {
+                        tables.insert(m.as_str().to_string());
+                    }
+                }
+            }
+        }
+
+        tables.into_iter().collect()
+    }
+
+    fn extract_service_calls(&self, content: &str) -> Vec<ServiceCall> {
+        let mut services = HashSet::new();
+        let url_pattern = r#"(?i)\b(https?|grpc)://[^\s'"`]+"#;
+
+        if let Ok(re) = Regex::new(url_pattern) {
+            for cap in re.captures_iter(content) {
+                let full = cap.get(0).map(|m| m.as_str()).unwrap_or_default();
+                let protocol = cap.get(1).map(|m| m.as_str()).unwrap_or("http");
+                if let Some(target) = extract_service_target(full) {
+                    services.insert((target, protocol.to_string()));
+                }
+            }
+        }
+
+        services
+            .into_iter()
+            .map(|(target, protocol)| ServiceCall { target, protocol })
+            .collect()
     }
 
     fn extract_params(&self, node: Node, content: &str) -> Vec<String> {
@@ -114,10 +160,9 @@ impl LanguageParser for TypeScriptParser {
         let inheritance_query = Query::new(
             tree_sitter_typescript::language_typescript(),
              r#"
-             (class_heritage 
-                (extends_clause 
-                    value: (identifier) @parent
-                )
+             (class_heritage
+                (extends_clause value: (identifier) @parent.extends)
+                (implements_clause (type_identifier) @parent.implements)
              )
              "#
         ).context("Failed to create inheritance query")?;
@@ -207,12 +252,23 @@ impl LanguageParser for TypeScriptParser {
                  let start_line = class_node.start_position().row + 1;
                  let end_line = class_node.end_position().row + 1;
 
-                 let mut parents = Vec::new();
+                 let mut inheritances = Vec::new();
                  let mut parent_cursor = QueryCursor::new();
                  let parent_matches = parent_cursor.matches(&inheritance_query, class_node, content.as_bytes());
                  for pm in parent_matches {
                       for c in pm.captures {
-                          parents.push(content[c.node.byte_range()].to_string());
+                          let capture_name = &inheritance_query.capture_names()[c.index as usize];
+                          if capture_name == "parent.extends" {
+                              inheritances.push(InheritanceInfo {
+                                  name: content[c.node.byte_range()].to_string(),
+                                  kind: "class".to_string(),
+                              });
+                          } else if capture_name == "parent.implements" {
+                              inheritances.push(InheritanceInfo {
+                                  name: content[c.node.byte_range()].to_string(),
+                                  kind: "interface".to_string(),
+                              });
+                          }
                       }
                  }
 
@@ -240,7 +296,7 @@ impl LanguageParser for TypeScriptParser {
 
                  classes.push(ClassInfo {
                      name: class_name,
-                     parents,
+                     inheritances,
                      methods,
                      start_line,
                      end_line,
@@ -264,13 +320,31 @@ impl LanguageParser for TypeScriptParser {
             }
         }
 
+        let data_tables = self.extract_data_tables(content);
+        let service_calls = self.extract_service_calls(content);
+
         Ok(ParsedFile {
             path: path.to_string_lossy().to_string(),
             language: "typescript".to_string(),
             functions,
             classes,
             imports,
+            data_tables,
+            service_calls,
         })
+    }
+}
+
+fn extract_service_target(url: &str) -> Option<String> {
+    let parts: Vec<&str> = url.split("//").collect();
+    let host_part = parts.get(1).copied().unwrap_or("");
+    let host = host_part.split('/').next().unwrap_or("");
+    let host = host.split('?').next().unwrap_or("");
+    let host = host.split('#').next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }
 
@@ -307,7 +381,10 @@ mod tests {
         
         // Classes
         let user = result.classes.iter().find(|c| c.name == "User").expect("User not found");
-        assert!(user.parents.contains(&"Person".to_string()));
+        assert!(user
+            .inheritances
+            .iter()
+            .any(|inheritance| inheritance.name == "Person" && inheritance.kind == "class"));
         
         let update = user.methods.iter().find(|m| m.name == "update").expect("update not found");
         assert_eq!(update.params, vec!["id", "name"]);

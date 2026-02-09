@@ -1,5 +1,6 @@
-use super::{ClassInfo, FunctionInfo, LanguageParser, ParsedFile};
+use super::{ClassInfo, FunctionInfo, InheritanceInfo, LanguageParser, ParsedFile, ServiceCall};
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
@@ -9,6 +10,50 @@ pub struct RustParser;
 impl RustParser {
     pub fn new() -> Result<Self> {
         Ok(RustParser)
+    }
+
+    fn extract_data_tables(&self, content: &str) -> Vec<String> {
+        let mut tables = HashSet::new();
+        let patterns = [
+            r"(?i)\bfrom\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\bjoin\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\binto\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\bupdate\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\bdelete\s+from\s+([a-zA-Z0-9_.]+)",
+            r#"(?i)\btable\(\s*['"]([a-zA-Z0-9_.]+)['"]"#,
+        ];
+
+        for pattern in patterns {
+            if let Ok(re) = Regex::new(pattern) {
+                for cap in re.captures_iter(content) {
+                    if let Some(m) = cap.get(1) {
+                        tables.insert(m.as_str().to_string());
+                    }
+                }
+            }
+        }
+
+        tables.into_iter().collect()
+    }
+
+    fn extract_service_calls(&self, content: &str) -> Vec<ServiceCall> {
+        let mut services = HashSet::new();
+        let url_pattern = r#"(?i)\b(https?|grpc)://[^\s'"`]+"#;
+
+        if let Ok(re) = Regex::new(url_pattern) {
+            for cap in re.captures_iter(content) {
+                let full = cap.get(0).map(|m| m.as_str()).unwrap_or_default();
+                let protocol = cap.get(1).map(|m| m.as_str()).unwrap_or("http");
+                if let Some(target) = extract_service_target(full) {
+                    services.insert((target, protocol.to_string()));
+                }
+            }
+        }
+
+        services
+            .into_iter()
+            .map(|(target, protocol)| ServiceCall { target, protocol })
+            .collect()
     }
 
     fn extract_params(&self, node: Node, content: &str) -> Vec<String> {
@@ -78,7 +123,7 @@ impl LanguageParser for RustParser {
             "#,
         )?;
 
-        let impl_query = Query::new(
+                let impl_query = Query::new(
             tree_sitter_rust::language(),
             r#"
             (impl_item
@@ -87,6 +132,16 @@ impl LanguageParser for RustParser {
             ) @impl
             "#,
         )?;
+
+                let trait_impl_query = Query::new(
+                        tree_sitter_rust::language(),
+                        r#"
+                        (impl_item
+                            trait: (type_identifier) @trait
+                            type: (type_identifier) @target
+                        ) @impl_trait
+                        "#,
+                )?;
 
         let call_query = Query::new(
             tree_sitter_rust::language(),
@@ -127,11 +182,41 @@ impl LanguageParser for RustParser {
             if !name.is_empty() {
                  class_map.insert(name.clone(), ClassInfo {
                      name,
-                     parents: Vec::new(),
+                     inheritances: Vec::new(),
                      methods: Vec::new(),
                      start_line: node.start_position().row + 1,
                      end_line: node.end_position().row + 1,
                  });
+            }
+        }
+
+        // 1b. Extract Trait Implementations
+        let trait_impl_matches = query_cursor.matches(&trait_impl_query, root_node, content.as_bytes());
+        for m in trait_impl_matches {
+            let mut trait_name = String::new();
+            let mut target_name = String::new();
+
+            for c in m.captures {
+                let cn = &trait_impl_query.capture_names()[c.index as usize];
+                if cn == "trait" {
+                    trait_name = content[c.node.byte_range()].to_string();
+                } else if cn == "target" {
+                    target_name = content[c.node.byte_range()].to_string();
+                }
+            }
+
+            if !trait_name.is_empty() && !target_name.is_empty() {
+                let entry = class_map.entry(target_name.clone()).or_insert(ClassInfo {
+                    name: target_name,
+                    inheritances: Vec::new(),
+                    methods: Vec::new(),
+                    start_line: 0,
+                    end_line: 0,
+                });
+                entry.inheritances.push(InheritanceInfo {
+                    name: trait_name,
+                    kind: "trait".to_string(),
+                });
             }
         }
 
@@ -153,7 +238,7 @@ impl LanguageParser for RustParser {
             if !target_name.is_empty() {
                  let mut class_info = class_map.remove(&target_name).unwrap_or(ClassInfo {
                      name: target_name.clone(),
-                     parents: Vec::new(),
+                     inheritances: Vec::new(),
                      methods: Vec::new(),
                      start_line: 0,
                      end_line: 0,
@@ -250,13 +335,31 @@ impl LanguageParser for RustParser {
             }
         }
 
+        let data_tables = self.extract_data_tables(content);
+        let service_calls = self.extract_service_calls(content);
+
         Ok(ParsedFile {
             path: path.to_string_lossy().to_string(),
             language: "rust".to_string(),
             functions,
             classes: class_map.into_values().collect(),
             imports,
+            data_tables,
+            service_calls,
         })
+    }
+}
+
+fn extract_service_target(url: &str) -> Option<String> {
+    let parts: Vec<&str> = url.split("//").collect();
+    let host_part = parts.get(1).copied().unwrap_or("");
+    let host = host_part.split('/').next().unwrap_or("");
+    let host = host.split('?').next().unwrap_or("");
+    let host = host.split('#').next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }
 

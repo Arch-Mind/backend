@@ -14,6 +14,8 @@ pub struct ParsedFile {
     pub functions: Vec<FunctionInfo>,
     pub classes: Vec<ClassInfo>,
     pub imports: Vec<String>,
+    pub data_tables: Vec<String>,
+    pub service_calls: Vec<ServiceCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,10 +31,23 @@ pub struct FunctionInfo {
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
     pub name: String,
-    pub parents: Vec<String>,
+    pub inheritances: Vec<InheritanceInfo>,
     pub methods: Vec<FunctionInfo>,
     pub start_line: usize,
     pub end_line: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct InheritanceInfo {
+    pub name: String,
+    /// class | interface | trait
+    pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceCall {
+    pub target: String,
+    pub protocol: String,
 }
 
 pub trait LanguageParser {

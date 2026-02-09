@@ -7,6 +7,7 @@ use crate::graph_builder::{DependencyGraph, EdgeType, NodeId};
 use crate::parsers::{FunctionInfo, ParsedFile};
 use crate::git_analyzer::RepoContributions;
 use crate::boundary_detector::BoundaryDetectionResult;
+use crate::dependency_metadata::LibraryDependency;
 use anyhow::{Context, Result};
 use neo4rs::query;
 use std::collections::HashMap;
@@ -102,6 +103,7 @@ pub async fn store_graph(
     dep_graph: &DependencyGraph,
     git_contributions: Option<&RepoContributions>,
     boundary_result: &BoundaryDetectionResult,
+    library_dependencies: &[LibraryDependency],
     config: Option<BatchConfig>,
 ) -> Result<()> {
     let config = config.unwrap_or_default();
@@ -119,6 +121,7 @@ pub async fn store_graph(
         dep_graph, 
         git_contributions,
         boundary_result,
+        library_dependencies,
         &config
     ).await;
 
@@ -144,6 +147,7 @@ async fn execute_batch_operations(
     dep_graph: &DependencyGraph,
     git_contributions: Option<&RepoContributions>,
     boundary_result: &BoundaryDetectionResult,
+    library_dependencies: &[LibraryDependency],
     config: &BatchConfig,
 ) -> Result<()> {
     // 1. Create Job node
@@ -158,6 +162,9 @@ async fn execute_batch_operations(
     // 3. Batch insert boundaries
     batch_insert_boundary_nodes(txn, job_id, repo_id, boundary_result, config.batch_size).await?;
 
+    // 3b. Batch insert library nodes
+    batch_insert_library_nodes(txn, job_id, repo_id, library_dependencies, config.batch_size).await?;
+
     // 4. Batch insert edges
     batch_insert_defines_edges(txn, repo_id, dep_graph, config.batch_size).await?;
     batch_insert_contains_edges(txn, repo_id, dep_graph, config.batch_size).await?;
@@ -165,6 +172,17 @@ async fn execute_batch_operations(
     batch_insert_imports_edges(txn, repo_id, dep_graph, config.batch_size).await?;
     batch_insert_inherits_edges(txn, repo_id, dep_graph, config.batch_size).await?;
     batch_insert_belongs_to_edges(txn, repo_id, boundary_result, config.batch_size).await?;
+
+    // 4b. Batch insert library edges
+    batch_insert_library_edges(txn, repo_id, parsed_files, library_dependencies, config.batch_size).await?;
+
+    // 4c. Batch insert data dependency edges (tables)
+    batch_insert_table_nodes(txn, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_table_edges(txn, repo_id, parsed_files, config.batch_size).await?;
+
+    // 4d. Batch insert service communication edges
+    batch_insert_service_nodes(txn, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_service_edges(txn, repo_id, parsed_files, config.batch_size).await?;
     
     // 5. Create file-to-file dependency edges based on imports
     batch_insert_file_dependencies(txn, repo_id, parsed_files, config.batch_size).await?;
@@ -368,6 +386,246 @@ async fn batch_insert_module_nodes(
     }
     
     info!("   Inserted {} Module nodes", nodes.len());
+    Ok(())
+}
+
+async fn batch_insert_library_nodes(
+    txn: &mut neo4rs::Txn,
+    job_id: &str,
+    repo_id: &str,
+    library_dependencies: &[LibraryDependency],
+    batch_size: usize,
+) -> Result<()> {
+    let mut nodes: Vec<BoltMap> = Vec::new();
+
+    for dep in library_dependencies {
+        let mut m = HashMap::new();
+        m.insert("name".to_string(), dep.name.clone());
+        m.insert("version".to_string(), dep.version.clone().unwrap_or_default());
+        m.insert("source_file".to_string(), dep.source_file.clone());
+        m.insert("job_id".to_string(), job_id.to_string());
+        m.insert("repo_id".to_string(), repo_id.to_string());
+        nodes.push(m);
+    }
+
+    for chunk in nodes.chunks(batch_size) {
+        let q = query(
+            "UNWIND $nodes AS node
+             MERGE (l:Library {name: node.name, repo_id: node.repo_id})
+             SET l.version = CASE WHEN node.version <> '' THEN node.version ELSE l.version END,
+                 l.source_file = node.source_file,
+                 l.job_id = node.job_id"
+        )
+        .param("nodes", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert library nodes")?;
+    }
+
+    info!("   Inserted {} Library nodes", nodes.len());
+    Ok(())
+}
+
+fn normalize_import_to_library(import_path: &str) -> Option<String> {
+    let trimmed = import_path.trim().trim_matches('"').trim_matches('`');
+    if trimmed.starts_with('.') || trimmed.starts_with('/') {
+        return None;
+    }
+
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with('@') && parts.len() >= 2 {
+        return Some(format!("{}/{}", parts[0], parts[1]));
+    }
+
+    Some(parts[0].to_string())
+}
+
+async fn batch_insert_library_edges(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    parsed_files: &[ParsedFile],
+    library_dependencies: &[LibraryDependency],
+    batch_size: usize,
+) -> Result<()> {
+    let mut library_versions = HashMap::new();
+    for dep in library_dependencies {
+        library_versions.insert(dep.name.clone(), dep.version.clone().unwrap_or_default());
+    }
+
+    let mut edges: Vec<BoltMap> = Vec::new();
+    for file in parsed_files {
+        for import in &file.imports {
+            if let Some(lib_name) = normalize_import_to_library(import) {
+                if library_versions.contains_key(&lib_name) {
+                    let mut m = HashMap::new();
+                    m.insert("file_path".to_string(), file.path.clone());
+                    m.insert("library_name".to_string(), lib_name.clone());
+                    m.insert(
+                        "library_version".to_string(),
+                        library_versions.get(&lib_name).cloned().unwrap_or_default(),
+                    );
+                    m.insert("repo_id".to_string(), repo_id.to_string());
+                    edges.push(m);
+                }
+            }
+        }
+    }
+
+    for chunk in edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (l:Library {name: edge.library_name, repo_id: edge.repo_id})
+             MERGE (f)-[r:DEPENDS_ON]->(l)
+             SET r.type = 'library',
+                 r.version = edge.library_version"
+        )
+        .param("edges", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert library edges")?;
+    }
+
+    info!("   Created {} Library DEPENDS_ON edges", edges.len());
+    Ok(())
+}
+
+async fn batch_insert_table_nodes(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    parsed_files: &[ParsedFile],
+    batch_size: usize,
+) -> Result<()> {
+    let mut nodes: Vec<BoltMap> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for file in parsed_files {
+        for table in &file.data_tables {
+            if seen.insert(table.clone()) {
+                let mut m = HashMap::new();
+                m.insert("name".to_string(), table.clone());
+                m.insert("repo_id".to_string(), repo_id.to_string());
+                nodes.push(m);
+            }
+        }
+    }
+
+    for chunk in nodes.chunks(batch_size) {
+        let q = query(
+            "UNWIND $nodes AS node
+             MERGE (t:Table {name: node.name, repo_id: node.repo_id})"
+        )
+        .param("nodes", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert table nodes")?;
+    }
+
+    info!("   Inserted {} Table nodes", nodes.len());
+    Ok(())
+}
+
+async fn batch_insert_table_edges(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    parsed_files: &[ParsedFile],
+    batch_size: usize,
+) -> Result<()> {
+    let mut edges: Vec<BoltMap> = Vec::new();
+    for file in parsed_files {
+        for table in &file.data_tables {
+            let mut m = HashMap::new();
+            m.insert("file_path".to_string(), file.path.clone());
+            m.insert("table_name".to_string(), table.clone());
+            m.insert("repo_id".to_string(), repo_id.to_string());
+            edges.push(m);
+        }
+    }
+
+    for chunk in edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (t:Table {name: edge.table_name, repo_id: edge.repo_id})
+             MERGE (f)-[:USES_TABLE]->(t)"
+        )
+        .param("edges", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert table edges")?;
+    }
+
+    info!("   Created {} USES_TABLE edges", edges.len());
+    Ok(())
+}
+
+async fn batch_insert_service_nodes(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    parsed_files: &[ParsedFile],
+    batch_size: usize,
+) -> Result<()> {
+    let mut nodes: Vec<BoltMap> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for file in parsed_files {
+        for service in &file.service_calls {
+            let key = format!("{}::{}", service.protocol, service.target);
+            if seen.insert(key) {
+                let mut m = HashMap::new();
+                m.insert("name".to_string(), service.target.clone());
+                m.insert("protocol".to_string(), service.protocol.clone());
+                m.insert("repo_id".to_string(), repo_id.to_string());
+                nodes.push(m);
+            }
+        }
+    }
+
+    for chunk in nodes.chunks(batch_size) {
+        let q = query(
+            "UNWIND $nodes AS node
+             MERGE (s:Service {name: node.name, protocol: node.protocol, repo_id: node.repo_id})"
+        )
+        .param("nodes", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert service nodes")?;
+    }
+
+    info!("   Inserted {} Service nodes", nodes.len());
+    Ok(())
+}
+
+async fn batch_insert_service_edges(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    parsed_files: &[ParsedFile],
+    batch_size: usize,
+) -> Result<()> {
+    let mut edges: Vec<BoltMap> = Vec::new();
+    for file in parsed_files {
+        for service in &file.service_calls {
+            let mut m = HashMap::new();
+            m.insert("file_path".to_string(), file.path.clone());
+            m.insert("service_name".to_string(), service.target.clone());
+            m.insert("service_protocol".to_string(), service.protocol.clone());
+            m.insert("repo_id".to_string(), repo_id.to_string());
+            edges.push(m);
+        }
+    }
+
+    for chunk in edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (s:Service {name: edge.service_name, protocol: edge.service_protocol, repo_id: edge.repo_id})
+             MERGE (f)-[:CALLS_SERVICE]->(s)"
+        )
+        .param("edges", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert service edges")?;
+    }
+
+    info!("   Created {} CALLS_SERVICE edges", edges.len());
     Ok(())
 }
 
@@ -578,6 +836,12 @@ async fn batch_insert_inherits_edges(
             continue;
         }
         
+        let inheritance_type = edge
+            .properties
+            .get("kind")
+            .cloned()
+            .unwrap_or_else(|| "class".to_string());
+
         match (&edge.from, &edge.to) {
             (NodeId::Class(from_file, from_name), NodeId::Class(to_file, to_name)) => {
                 let from_id = get_qualified_id(from_file, from_name);
@@ -587,6 +851,7 @@ async fn batch_insert_inherits_edges(
                 m.insert("from_id".to_string(), from_id);
                 m.insert("to_id".to_string(), to_id);
                 m.insert("repo_id".to_string(), repo_id.to_string());
+                m.insert("inheritance_type".to_string(), inheritance_type.clone());
                 class_to_class.push(m);
             }
             (NodeId::Class(class_file, class_name), NodeId::Module(module_name)) => {
@@ -596,6 +861,7 @@ async fn batch_insert_inherits_edges(
                 m.insert("class_id".to_string(), class_id);
                 m.insert("module_name".to_string(), module_name.to_string());
                 m.insert("repo_id".to_string(), repo_id.to_string());
+                m.insert("inheritance_type".to_string(), inheritance_type.clone());
                 class_to_module.push(m);
             }
             _ => {}
@@ -608,7 +874,8 @@ async fn batch_insert_inherits_edges(
             "UNWIND $edges AS edge
              MATCH (child:Class {id: edge.from_id, repo_id: edge.repo_id})
              MATCH (parent:Class {id: edge.to_id, repo_id: edge.repo_id})
-             MERGE (child)-[:INHERITS]->(parent)"
+               MERGE (child)-[r:INHERITS]->(parent)
+               SET r.type = edge.inheritance_type"
         )
         .param("edges", chunk.to_vec());
         
@@ -621,7 +888,8 @@ async fn batch_insert_inherits_edges(
             "UNWIND $edges AS edge
              MATCH (child:Class {id: edge.class_id, repo_id: edge.repo_id})
              MATCH (parent:Module {name: edge.module_name, repo_id: edge.repo_id})
-             MERGE (child)-[:INHERITS]->(parent)"
+               MERGE (child)-[r:INHERITS]->(parent)
+               SET r.type = edge.inheritance_type"
         )
         .param("edges", chunk.to_vec());
         

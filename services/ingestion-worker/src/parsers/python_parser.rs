@@ -1,5 +1,6 @@
-use super::{ClassInfo, FunctionInfo, LanguageParser, ParsedFile};
+use super::{ClassInfo, FunctionInfo, InheritanceInfo, LanguageParser, ParsedFile, ServiceCall};
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
@@ -9,6 +10,50 @@ pub struct PythonParser;
 impl PythonParser {
     pub fn new() -> Result<Self> {
         Ok(PythonParser)
+    }
+
+    fn extract_data_tables(&self, content: &str) -> Vec<String> {
+        let mut tables = HashSet::new();
+        let patterns = [
+            r"(?i)\bfrom\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\bjoin\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\binto\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\bupdate\s+([a-zA-Z0-9_.]+)",
+            r"(?i)\bdelete\s+from\s+([a-zA-Z0-9_.]+)",
+            r#"(?i)\btable\(\s*['"]([a-zA-Z0-9_.]+)['"]"#,
+        ];
+
+        for pattern in patterns {
+            if let Ok(re) = Regex::new(pattern) {
+                for cap in re.captures_iter(content) {
+                    if let Some(m) = cap.get(1) {
+                        tables.insert(m.as_str().to_string());
+                    }
+                }
+            }
+        }
+
+        tables.into_iter().collect()
+    }
+
+    fn extract_service_calls(&self, content: &str) -> Vec<ServiceCall> {
+        let mut services = HashSet::new();
+        let url_pattern = r#"(?i)\b(https?|grpc)://[^\s'"`]+"#;
+
+        if let Ok(re) = Regex::new(url_pattern) {
+            for cap in re.captures_iter(content) {
+                let full = cap.get(0).map(|m| m.as_str()).unwrap_or_default();
+                let protocol = cap.get(1).map(|m| m.as_str()).unwrap_or("http");
+                if let Some(target) = extract_service_target(full) {
+                    services.insert((target, protocol.to_string()));
+                }
+            }
+        }
+
+        services
+            .into_iter()
+            .map(|(target, protocol)| ServiceCall { target, protocol })
+            .collect()
     }
 
     fn extract_params(&self, node: Node, content: &str) -> Vec<String> {
@@ -157,13 +202,16 @@ impl LanguageParser for PythonParser {
                  let start_line = node.start_position().row + 1;
                  let end_line = node.end_position().row + 1;
                  
-                 let mut parents = Vec::new();
+                 let mut inheritances = Vec::new();
                  let mut parent_cursor = QueryCursor::new();
                  let im = parent_cursor.matches(&inheritance_query, node, content.as_bytes());
                  for pm in im {
                      for c in pm.captures {
                          if inheritance_query.capture_names()[c.index as usize] == "parent" {
-                              parents.push(content[c.node.byte_range()].to_string());
+                              inheritances.push(InheritanceInfo {
+                                  name: content[c.node.byte_range()].to_string(),
+                                  kind: "class".to_string(),
+                              });
                          }
                      }
                  }
@@ -188,7 +236,7 @@ impl LanguageParser for PythonParser {
                  
                  classes.push(ClassInfo {
                      name,
-                     parents,
+                     inheritances,
                      methods,
                      start_line,
                      end_line,
@@ -236,13 +284,31 @@ impl LanguageParser for PythonParser {
              }
         }
 
+        let data_tables = self.extract_data_tables(content);
+        let service_calls = self.extract_service_calls(content);
+
         Ok(ParsedFile {
             path: path.to_string_lossy().to_string(),
             language: "python".to_string(),
             functions,
             classes,
             imports,
+            data_tables,
+            service_calls,
         })
+    }
+}
+
+fn extract_service_target(url: &str) -> Option<String> {
+    let parts: Vec<&str> = url.split("//").collect();
+    let host_part = parts.get(1).copied().unwrap_or("");
+    let host = host_part.split('/').next().unwrap_or("");
+    let host = host.split('?').next().unwrap_or("");
+    let host = host.split('#').next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }
 
@@ -278,7 +344,10 @@ mod tests {
         
         // Classes
         let processor = result.classes.iter().find(|c| c.name == "Processor").expect("Processor not found");
-        assert!(processor.parents.contains(&"BaseProcessor".to_string()));
+        assert!(processor
+            .inheritances
+            .iter()
+            .any(|inheritance| inheritance.name == "BaseProcessor" && inheritance.kind == "class"));
         
         let process = processor.methods.iter().find(|m| m.name == "process").expect("process not found");
         assert_eq!(process.params, vec!["self", "data"]);

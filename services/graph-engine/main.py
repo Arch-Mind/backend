@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List, Optional
@@ -620,14 +620,14 @@ async def get_module_boundaries(repo_id: str, boundary_type: Optional[str] = Non
 async def get_dependencies(
     repo_id: str,
     file_path: Optional[str] = None,
-    dependency_type: Optional[str] = None
+    dependency_type: Optional[str] = Query(None, alias="type")
 ):
     """
     Get import/dependency relationships for a repository or specific file.
     
     Query Parameters:
     - file_path: Filter dependencies for a specific file
-    - dependency_type: Filter by edge type (IMPORTS, CALLS, DEPENDS_ON)
+    - type: Filter by dependency type (import, inheritance, library, data, service)
     
     Returns dependency mappings with file-to-file and function-call relationships.
     """
@@ -644,27 +644,44 @@ async def get_dependencies(
                 where_clauses.append("f.path = $file_path")
                 params["file_path"] = file_path
             
-            # Query for IMPORTS edges (file-to-module dependencies)
             edge_filter = ""
-            if dependency_type and dependency_type.upper() == "IMPORTS":
-                edge_filter = ":IMPORTS"
-            elif dependency_type and dependency_type.upper() == "CALLS":
-                edge_filter = ":CALLS"
-            elif dependency_type:
-                edge_filter = f":{dependency_type.upper()}"
+            target_filter = ""
+            if dependency_type:
+                dep_type = dependency_type.lower()
+                type_map = {
+                    "import": ["IMPORTS", "DEPENDS_ON"],
+                    "inheritance": ["INHERITS"],
+                    "library": ["DEPENDS_ON"],
+                    "data": ["USES_TABLE"],
+                    "service": ["CALLS_SERVICE"],
+                }
+                edge_types = type_map.get(dep_type)
+                if edge_types:
+                    edge_filter = ":" + "|".join(edge_types)
+                if dep_type == "library":
+                    target_filter = "AND target:Library"
+                elif dep_type == "data":
+                    target_filter = "AND target:Table"
+                elif dep_type == "service":
+                    target_filter = "AND target:Service"
             
             query = f"""
             MATCH (f:File)-[r{edge_filter}]->(target)
             WHERE {' AND '.join(where_clauses)}
+            {target_filter}
             RETURN 
                 f.path as source_file,
                 f.language as source_language,
                 type(r) as relationship_type,
+                properties(r) as relationship_properties,
                 CASE 
                     WHEN target:File THEN target.path
                     WHEN target:Module THEN target.name
                     WHEN target:Function THEN target.name
                     WHEN target:Class THEN target.name
+                    WHEN target:Library THEN target.name
+                    WHEN target:Table THEN target.name
+                    WHEN target:Service THEN target.name
                     ELSE 'Unknown'
                 END as target_name,
                 labels(target)[0] as target_type
@@ -688,7 +705,8 @@ async def get_dependencies(
                     "source_language": record["source_language"],
                     "target": target,
                     "target_type": target_type,
-                    "relationship": rel_type
+                    "relationship": rel_type,
+                    "relationship_properties": record["relationship_properties"]
                 }
                 dependencies.append(dep_entry)
                 
@@ -767,7 +785,7 @@ async def get_dependency_tree(repo_id: str, file_path: str, max_depth: int = 3):
         with neo4j_driver.session() as session:
             # Use Cypher path query to get dependency tree
             query = """
-            MATCH path = (f:File {path: $file_path})-[:IMPORTS|CALLS*1..%d]->(target)
+            MATCH path = (f:File {path: $file_path})-[:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS*1..%d]->(target)
             WHERE (f.repo_id = $repo_id OR f.job_id = $repo_id)
             WITH path, target, length(path) as depth
             RETURN 
@@ -864,7 +882,7 @@ async def get_full_dependency_graph(repo_id: str, limit: int = 500):
             
             # Get all edges
             edges_query = """
-            MATCH (source)-[r:IMPORTS|CALLS|DEFINES|CONTAINS|INHERITS|BELONGS_TO]->(target)
+            MATCH (source)-[r:IMPORTS|CALLS|DEFINES|CONTAINS|INHERITS|BELONGS_TO|DEPENDS_ON|USES_TABLE|CALLS_SERVICE]->(target)
             WHERE (source.repo_id = $repo_id OR source.job_id = $repo_id)
             RETURN 
                 CASE 

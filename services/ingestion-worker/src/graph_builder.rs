@@ -85,6 +85,7 @@ pub struct Edge {
     pub from: NodeId,
     pub to: NodeId,
     pub edge_type: EdgeType,
+    pub properties: HashMap<String, String>,
 }
 
 // ============================================================================
@@ -253,6 +254,7 @@ impl DependencyGraph {
                     from: file_node.clone(),
                     to: func_node.clone(),
                     edge_type: EdgeType::Defines,
+                    properties: HashMap::new(),
                 });
 
                 // Process function calls
@@ -269,27 +271,34 @@ impl DependencyGraph {
                     from: file_node.clone(),
                     to: class_node.clone(),
                     edge_type: EdgeType::Defines,
+                    properties: HashMap::new(),
                 });
 
                 // Process inheritance
-                for parent in &class.parents {
-                    if let Some(parent_entry) = symbol_table.resolve_class(parent, &file.path) {
+                for inheritance in &class.inheritances {
+                    if let Some(parent_entry) = symbol_table.resolve_class(&inheritance.name, &file.path) {
                         let parent_node =
-                            NodeId::Class(parent_entry.file_path.clone(), parent.clone());
+                            NodeId::Class(parent_entry.file_path.clone(), inheritance.name.clone());
                         graph.nodes.insert(parent_node.clone());
+                        let mut properties = HashMap::new();
+                        properties.insert("kind".to_string(), inheritance.kind.clone());
                         graph.edges.push(Edge {
                             from: class_node.clone(),
                             to: parent_node,
                             edge_type: EdgeType::Inherits,
+                            properties,
                         });
                     } else {
                         // External parent class - create a module node
-                        let parent_node = NodeId::Module(parent.clone());
+                        let parent_node = NodeId::Module(inheritance.name.clone());
                         graph.nodes.insert(parent_node.clone());
+                        let mut properties = HashMap::new();
+                        properties.insert("kind".to_string(), inheritance.kind.clone());
                         graph.edges.push(Edge {
                             from: class_node.clone(),
                             to: parent_node,
                             edge_type: EdgeType::Inherits,
+                            properties,
                         });
                     }
                 }
@@ -304,6 +313,7 @@ impl DependencyGraph {
                         from: class_node.clone(),
                         to: method_node.clone(),
                         edge_type: EdgeType::Contains,
+                        properties: HashMap::new(),
                     });
 
                     // Process method calls
@@ -320,6 +330,7 @@ impl DependencyGraph {
                     from: file_node.clone(),
                     to: module_node,
                     edge_type: EdgeType::Imports,
+                    properties: HashMap::new(),
                 });
             }
         }
@@ -344,6 +355,7 @@ impl DependencyGraph {
                     from: caller_node.clone(),
                     to: callee_node,
                     edge_type: EdgeType::Calls,
+                    properties: HashMap::new(),
                 });
             }
             // If unresolved, we skip - it's likely an external/built-in function
@@ -399,7 +411,7 @@ pub struct GraphStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsers::{ClassInfo, FunctionInfo, ParsedFile};
+    use crate::parsers::{ClassInfo, FunctionInfo, InheritanceInfo, ParsedFile};
 
     fn make_func(name: &str, calls: Vec<&str>) -> FunctionInfo {
         FunctionInfo {
@@ -415,7 +427,13 @@ mod tests {
     fn make_class(name: &str, parents: Vec<&str>, methods: Vec<FunctionInfo>) -> ClassInfo {
         ClassInfo {
             name: name.to_string(),
-            parents: parents.into_iter().map(String::from).collect(),
+            inheritances: parents
+                .into_iter()
+                .map(|p| InheritanceInfo {
+                    name: p.to_string(),
+                    kind: "class".to_string(),
+                })
+                .collect(),
             methods,
             start_line: 1,
             end_line: 50,
@@ -431,6 +449,8 @@ mod tests {
                 functions: vec![make_func("foo", vec!["bar"])],
                 classes: vec![],
                 imports: vec![],
+                data_tables: vec![],
+                service_calls: vec![],
             },
             ParsedFile {
                 path: "file_b.rs".to_string(),
@@ -438,6 +458,8 @@ mod tests {
                 functions: vec![make_func("bar", vec![])],
                 classes: vec![],
                 imports: vec![],
+                data_tables: vec![],
+                service_calls: vec![],
             },
         ];
 
@@ -457,6 +479,8 @@ mod tests {
                 functions: vec![make_func("main", vec!["helper"])],
                 classes: vec![],
                 imports: vec![],
+                data_tables: vec![],
+                service_calls: vec![],
             },
             ParsedFile {
                 path: "callee.rs".to_string(),
@@ -464,6 +488,8 @@ mod tests {
                 functions: vec![make_func("helper", vec![])],
                 classes: vec![],
                 imports: vec![],
+                data_tables: vec![],
+                service_calls: vec![],
             },
         ];
 
@@ -487,6 +513,8 @@ mod tests {
                 make_class("Dog", vec!["Animal"], vec![make_func("bark", vec![])]),
             ],
             imports: vec![],
+            data_tables: vec![],
+            service_calls: vec![],
         }];
 
         let table = SymbolTable::from_parsed_files(&files);

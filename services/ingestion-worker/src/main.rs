@@ -3,6 +3,7 @@ mod neo4j_storage;
 mod parsers;
 mod git_analyzer;
 mod boundary_detector;
+mod dependency_metadata;
 
 use anyhow::{Context, Result};
 use parsers::{
@@ -21,6 +22,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
+use dependency_metadata::LibraryDependency;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AnalysisJob {
@@ -456,6 +458,10 @@ async fn analyze_repository(
     let boundary_result = boundary_detector::BoundaryDetector::detect_boundaries(&parsed_files, &temp_repo.path)?;
     info!("🗺️  Detected {} module boundaries", boundary_result.boundaries.len());
 
+    // Step 5b: Collect library dependencies from manifests
+    let library_dependencies = collect_library_dependencies(&temp_repo.path)?;
+    info!("📦 Detected {} library dependencies", library_dependencies.len());
+
     // Update progress: 60%
     if let Err(e) = api_client.update_job(&job.job_id, JobUpdatePayload {
         status: None,
@@ -492,6 +498,7 @@ async fn analyze_repository(
         &dep_graph, 
         git_contributions.as_ref(),
         &boundary_result,
+        &library_dependencies,
         None
     ).await?;
     info!("💾 Stored graph data in Neo4j (batch mode)");
@@ -624,6 +631,224 @@ fn parse_repository(repo_path: &std::path::PathBuf) -> Result<Vec<ParsedFile>> {
     
     info!("📄 Successfully parsed {} files", parsed_files.len());
     Ok(parsed_files)
+}
+
+fn collect_library_dependencies(repo_path: &PathBuf) -> Result<Vec<LibraryDependency>> {
+    use std::collections::HashSet;
+
+    let mut manifest_files = Vec::new();
+    collect_manifest_files(repo_path, &mut manifest_files)?;
+
+    let mut deps_set: HashSet<(String, Option<String>, String)> = HashSet::new();
+
+    for file in manifest_files {
+        let relative_path = file.strip_prefix(repo_path).unwrap_or(&file);
+        let source_file = relative_path.to_string_lossy().replace("\\", "/");
+        let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        let entries = match file_name {
+            "package.json" => parse_package_json(&file, &source_file)?,
+            "requirements.txt" => parse_requirements_txt(&file, &source_file)?,
+            "Cargo.toml" => parse_cargo_toml(&file, &source_file)?,
+            "go.mod" => parse_go_mod(&file, &source_file)?,
+            _ => Vec::new(),
+        };
+
+        for dep in entries {
+            deps_set.insert((dep.name, dep.version, dep.source_file));
+        }
+    }
+
+    let mut dependencies = Vec::new();
+    for (name, version, source_file) in deps_set {
+        dependencies.push(LibraryDependency {
+            name,
+            version,
+            source_file,
+        });
+    }
+
+    dependencies.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(dependencies)
+}
+
+fn collect_manifest_files(current_dir: &PathBuf, results: &mut Vec<PathBuf>) -> Result<()> {
+    if !current_dir.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(current_dir).context("Failed to read directory")? {
+        let entry = entry.context("Failed to read directory entry")?;
+        let path = entry.path();
+
+        if let Some(name) = path.file_name() {
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.')
+                || name_str == "node_modules"
+                || name_str == "target"
+                || name_str == "dist"
+                || name_str == "build"
+                || name_str == "venv"
+                || name_str == "__pycache__" {
+                continue;
+            }
+        }
+
+        if path.is_dir() {
+            collect_manifest_files(&path, results)?;
+        } else if path.is_file() {
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                if file_name == "package.json"
+                    || file_name == "requirements.txt"
+                    || file_name == "Cargo.toml"
+                    || file_name == "go.mod" {
+                    results.push(path);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_package_json(path: &PathBuf, source_file: &str) -> Result<Vec<LibraryDependency>> {
+    let content = fs::read_to_string(path).context("Failed to read package.json")?;
+    let json: serde_json::Value = serde_json::from_str(&content).context("Failed to parse package.json")?;
+
+    let mut deps = Vec::new();
+    for section in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] {
+        if let Some(obj) = json.get(section).and_then(|v| v.as_object()) {
+            for (name, value) in obj {
+                let version = value.as_str().map(|v| v.to_string());
+                deps.push(LibraryDependency {
+                    name: name.clone(),
+                    version,
+                    source_file: source_file.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(deps)
+}
+
+fn parse_requirements_txt(path: &PathBuf, source_file: &str) -> Result<Vec<LibraryDependency>> {
+    use regex::Regex;
+
+    let content = fs::read_to_string(path).context("Failed to read requirements.txt")?;
+    let line_re = Regex::new(r"^\s*([A-Za-z0-9_.\-]+)\s*([=<>!~]+\s*[^\s;]+)?")
+        .context("Failed to build requirements regex")?;
+
+    let mut deps = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Some(cap) = line_re.captures(trimmed) {
+            let name = cap.get(1).map(|m| m.as_str().to_string());
+            let version = cap.get(2).map(|m| m.as_str().trim().to_string());
+            if let Some(name) = name {
+                deps.push(LibraryDependency {
+                    name,
+                    version,
+                    source_file: source_file.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(deps)
+}
+
+fn parse_cargo_toml(path: &PathBuf, source_file: &str) -> Result<Vec<LibraryDependency>> {
+    use regex::Regex;
+
+    let content = fs::read_to_string(path).context("Failed to read Cargo.toml")?;
+    let simple_re = Regex::new(r#"^\s*([A-Za-z0-9_\-]+)\s*=\s*\"([^\"]+)\""#)
+        .context("Failed to build Cargo.toml regex")?;
+    let table_re = Regex::new(r#"^\s*([A-Za-z0-9_\-]+)\s*=\s*\{[^}]*version\s*=\s*\"([^\"]+)\"[^}]*\}"#)
+        .context("Failed to build Cargo.toml table regex")?;
+
+    let mut deps = Vec::new();
+    let mut in_deps = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_deps = matches!(trimmed, "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]");
+            continue;
+        }
+
+        if !in_deps || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Some(cap) = table_re.captures(trimmed) {
+            deps.push(LibraryDependency {
+                name: cap.get(1).unwrap().as_str().to_string(),
+                version: Some(cap.get(2).unwrap().as_str().to_string()),
+                source_file: source_file.to_string(),
+            });
+            continue;
+        }
+
+        if let Some(cap) = simple_re.captures(trimmed) {
+            deps.push(LibraryDependency {
+                name: cap.get(1).unwrap().as_str().to_string(),
+                version: Some(cap.get(2).unwrap().as_str().to_string()),
+                source_file: source_file.to_string(),
+            });
+        }
+    }
+
+    Ok(deps)
+}
+
+fn parse_go_mod(path: &PathBuf, source_file: &str) -> Result<Vec<LibraryDependency>> {
+    use regex::Regex;
+
+    let content = fs::read_to_string(path).context("Failed to read go.mod")?;
+    let single_re = Regex::new(r"^\s*require\s+([^\s]+)\s+([^\s]+)")
+        .context("Failed to build go.mod require regex")?;
+    let entry_re = Regex::new(r"^\s*([^\s]+)\s+([^\s]+)")
+        .context("Failed to build go.mod entry regex")?;
+
+    let mut deps = Vec::new();
+    let mut in_require_block = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("require (") {
+            in_require_block = true;
+            continue;
+        }
+        if in_require_block && trimmed.starts_with(')') {
+            in_require_block = false;
+            continue;
+        }
+
+        if let Some(cap) = single_re.captures(trimmed) {
+            deps.push(LibraryDependency {
+                name: cap.get(1).unwrap().as_str().to_string(),
+                version: Some(cap.get(2).unwrap().as_str().to_string()),
+                source_file: source_file.to_string(),
+            });
+            continue;
+        }
+
+        if in_require_block {
+            if let Some(cap) = entry_re.captures(trimmed) {
+                deps.push(LibraryDependency {
+                    name: cap.get(1).unwrap().as_str().to_string(),
+                    version: Some(cap.get(2).unwrap().as_str().to_string()),
+                    source_file: source_file.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(deps)
 }
 
 pub(crate) fn walk_directory(
