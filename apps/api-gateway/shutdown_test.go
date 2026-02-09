@@ -28,7 +28,7 @@ func TestShutdownSignalHandling(t *testing.T) {
 // TestShutdownTimeout tests 30-second shutdown timeout
 func TestShutdownTimeout(t *testing.T) {
 	expectedTimeout := 30 * time.Second
-	
+
 	// Create context with timeout (as done in main)
 	ctx, cancel := context.WithTimeout(context.Background(), expectedTimeout)
 	defer cancel()
@@ -36,7 +36,7 @@ func TestShutdownTimeout(t *testing.T) {
 	// Verify timeout duration
 	deadline, ok := ctx.Deadline()
 	assert.True(t, ok, "Context should have a deadline")
-	
+
 	remaining := time.Until(deadline)
 	assert.True(t, remaining <= expectedTimeout && remaining > 29*time.Second,
 		"Timeout should be approximately 30 seconds, got %v", remaining)
@@ -46,7 +46,7 @@ func TestShutdownTimeout(t *testing.T) {
 func TestDatabaseConnectionClosing(t *testing.T) {
 	// Simulate database connection close logic
 	var dbClosed bool
-	
+
 	// Mock database close function
 	closeDB := func(db *sql.DB) error {
 		dbClosed = true
@@ -56,7 +56,7 @@ func TestDatabaseConnectionClosing(t *testing.T) {
 	// Simulate closing
 	mockDB := &sql.DB{}
 	err := closeDB(mockDB)
-	
+
 	assert.NoError(t, err, "Database close should not error")
 	assert.True(t, dbClosed, "Database should be marked as closed")
 }
@@ -93,9 +93,7 @@ func TestGracefulShutdownSequence(t *testing.T) {
 		"Shutdown steps should execute in correct order")
 }
 
-// TestContextCancellation tests context
-
- cancellation behavior
+// TestContextCancellation tests context cancellation behavior
 func TestContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -124,27 +122,27 @@ func TestConnectionCleanupOnError(t *testing.T) {
 	}
 
 	tests := []struct {
-		name       string
-		dbState    ConnectionState
-		redisState ConnectionState
+		name          string
+		dbState       ConnectionState
+		redisState    ConnectionState
 		expectCleanup bool
 	}{
 		{
-			name:       "Both connections close successfully",
-			dbState:    ConnectionState{closed: true, errored: false},
-			redisState: ConnectionState{closed: true, errored: false},
+			name:          "Both connections close successfully",
+			dbState:       ConnectionState{closed: true, errored: false},
+			redisState:    ConnectionState{closed: true, errored: false},
 			expectCleanup: true,
 		},
 		{
-			name:       "DB errors but Redis closes",
-			dbState:    ConnectionState{closed: false, errored: true},
-			redisState: ConnectionState{closed: true, errored: false},
+			name:          "DB errors but Redis closes",
+			dbState:       ConnectionState{closed: false, errored: true},
+			redisState:    ConnectionState{closed: true, errored: false},
 			expectCleanup: true, // Should still attempt Redis cleanup
 		},
 		{
-			name:       "Both error but cleanup attempted",
-			dbState:    ConnectionState{closed: false, errored: true},
-			redisState: ConnectionState{closed: false, errored: true},
+			name:          "Both error but cleanup attempted",
+			dbState:       ConnectionState{closed: false, errored: true},
+			redisState:    ConnectionState{closed: false, errored: true},
 			expectCleanup: true, // Cleanup attempted despite errors
 		},
 	}
@@ -235,13 +233,13 @@ func BenchmarkShutdownSequence(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Simulate shutdown steps
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		
+
 		// Simulate cleanup
 		var cleaned bool
 		if ctx.Err() == nil {
 			cleaned = true
 		}
-		
+
 		cancel()
 		_ = cleaned
 	}

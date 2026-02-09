@@ -35,6 +35,10 @@ impl Default for BatchConfig {
 type BoltMap = HashMap<String, String>;
 type BoltMapI64 = HashMap<String, i64>;
 
+fn get_qualified_id(file_path: &str, name: &str) -> String {
+    format!("{}::{}", file_path, name)
+}
+
 fn file_node_to_map(path: &str, language: &str, job_id: &str, repo_id: &str) -> BoltMap {
     let mut m = HashMap::new();
     m.insert("id".to_string(), path.to_string()); // ID is the relative path
@@ -47,7 +51,7 @@ fn file_node_to_map(path: &str, language: &str, job_id: &str, repo_id: &str) -> 
 
 fn class_node_to_map(name: &str, file: &str, start_line: usize, end_line: usize, job_id: &str, repo_id: &str) -> HashMap<String, neo4rs::BoltType> {
     let mut m: HashMap<String, neo4rs::BoltType> = HashMap::new();
-    let id = format!("{}::{}", file, name); // ID is file::name
+    let id = get_qualified_id(file, name); // ID is file::name
     m.insert("id".to_string(), id.into());
     m.insert("name".to_string(), name.to_string().into());
     m.insert("file".to_string(), file.to_string().into());
@@ -60,7 +64,7 @@ fn class_node_to_map(name: &str, file: &str, start_line: usize, end_line: usize,
 
 fn function_node_to_map(func: &FunctionInfo, file: &str, job_id: &str, repo_id: &str) -> HashMap<String, neo4rs::BoltType> {
     let mut m: HashMap<String, neo4rs::BoltType> = HashMap::new();
-    let id = format!("{}::{}", file, func.name); // ID is file::name
+    let id = get_qualified_id(file, &func.name); // ID is file::name
     m.insert("id".to_string(), id.into());
     m.insert("name".to_string(), func.name.clone().into());
     m.insert("file".to_string(), file.to_string().into());
@@ -81,29 +85,7 @@ fn module_node_to_map(name: &str, job_id: &str, repo_id: &str) -> BoltMap {
     m
 }
 
-fn edge_2_map(key1: &str, val1: &str, key2: &str, val2: &str) -> BoltMap {
-    let mut m = HashMap::new();
-    m.insert(key1.to_string(), val1.to_string());
-    m.insert(key2.to_string(), val2.to_string());
-    m
-}
 
-fn edge_4_map(k1: &str, v1: &str, k2: &str, v2: &str, k3: &str, v3: &str, k4: &str, v4: &str) -> BoltMap {
-    let mut m = HashMap::new();
-    m.insert(k1.to_string(), v1.to_string());
-    m.insert(k2.to_string(), v2.to_string());
-    m.insert(k3.to_string(), v3.to_string());
-    m.insert(k4.to_string(), v4.to_string());
-    m
-}
-
-fn edge_3_map(k1: &str, v1: &str, k2: &str, v2: &str, k3: &str, v3: &str) -> BoltMap {
-    let mut m = HashMap::new();
-    m.insert(k1.to_string(), v1.to_string());
-    m.insert(k2.to_string(), v2.to_string());
-    m.insert(k3.to_string(), v3.to_string());
-    m
-}
 
 // ============================================================================
 // Main Storage Function
@@ -159,11 +141,11 @@ async fn execute_batch_operations(
     batch_insert_module_nodes(txn, job_id, repo_id, dep_graph, config.batch_size).await?;
 
     // 3. Batch insert edges
-    batch_insert_defines_edges(txn, dep_graph, config.batch_size).await?;
-    batch_insert_contains_edges(txn, dep_graph, config.batch_size).await?;
-    batch_insert_calls_edges(txn, dep_graph, config.batch_size).await?;
-    batch_insert_imports_edges(txn, dep_graph, config.batch_size).await?;
-    batch_insert_inherits_edges(txn, dep_graph, config.batch_size).await?;
+    batch_insert_defines_edges(txn, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_contains_edges(txn, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_calls_edges(txn, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_imports_edges(txn, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_inherits_edges(txn, repo_id, dep_graph, config.batch_size).await?;
 
     Ok(())
 }
@@ -339,6 +321,7 @@ async fn batch_insert_module_nodes(
 
 async fn batch_insert_defines_edges(
     txn: &mut neo4rs::Txn,
+    repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
 ) -> Result<()> {
@@ -351,11 +334,21 @@ async fn batch_insert_defines_edges(
         }
         
         match (&edge.from, &edge.to) {
-            (NodeId::File(file_path), NodeId::Class(_, class_name)) => {
-                file_to_class.push(edge_2_map("file_path", file_path, "class_name", class_name));
+            (NodeId::File(file_path), NodeId::Class(class_file, class_name)) => {
+                let class_id = get_qualified_id(class_file, class_name);
+                let mut m = HashMap::new();
+                m.insert("file_path".to_string(), file_path.to_string());
+                m.insert("class_id".to_string(), class_id);
+                m.insert("repo_id".to_string(), repo_id.to_string());
+                file_to_class.push(m);
             }
-            (NodeId::File(file_path), NodeId::Function(_, func_name)) => {
-                file_to_func.push(edge_2_map("file_path", file_path, "func_name", func_name));
+            (NodeId::File(file_path), NodeId::Function(func_file, func_name)) => {
+                let func_id = get_qualified_id(func_file, func_name);
+                let mut m = HashMap::new();
+                m.insert("file_path".to_string(), file_path.to_string());
+                m.insert("func_id".to_string(), func_id);
+                m.insert("repo_id".to_string(), repo_id.to_string());
+                file_to_func.push(m);
             }
             _ => {}
         }
@@ -365,8 +358,8 @@ async fn batch_insert_defines_edges(
     for chunk in file_to_class.chunks(batch_size) {
         let q = query(
             "UNWIND $edges AS edge
-             MATCH (f:File {path: edge.file_path})
-             MATCH (c:Class {name: edge.class_name, file: edge.file_path})
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (c:Class {id: edge.class_id, repo_id: edge.repo_id})
              MERGE (f)-[:DEFINES]->(c)"
         )
         .param("edges", chunk.to_vec());
@@ -378,8 +371,8 @@ async fn batch_insert_defines_edges(
     for chunk in file_to_func.chunks(batch_size) {
         let q = query(
             "UNWIND $edges AS edge
-             MATCH (f:File {path: edge.file_path})
-             MATCH (fn:Function {name: edge.func_name, file: edge.file_path})
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (fn:Function {id: edge.func_id, repo_id: edge.repo_id})
              MERGE (f)-[:DEFINES]->(fn)"
         )
         .param("edges", chunk.to_vec());
@@ -393,6 +386,7 @@ async fn batch_insert_defines_edges(
 
 async fn batch_insert_contains_edges(
     txn: &mut neo4rs::Txn,
+    repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
 ) -> Result<()> {
@@ -406,20 +400,22 @@ async fn batch_insert_contains_edges(
         if let (NodeId::Class(class_file, class_name), NodeId::Function(func_file, func_name)) = 
             (&edge.from, &edge.to) 
         {
-            edges.push(edge_4_map(
-                "class_file", class_file, 
-                "class_name", class_name,
-                "func_file", func_file,
-                "func_name", func_name
-            ));
+            let class_id = get_qualified_id(class_file, class_name);
+            let func_id = get_qualified_id(func_file, func_name);
+            
+            let mut m = HashMap::new();
+            m.insert("class_id".to_string(), class_id);
+            m.insert("func_id".to_string(), func_id);
+            m.insert("repo_id".to_string(), repo_id.to_string());
+            edges.push(m);
         }
     }
 
     for chunk in edges.chunks(batch_size) {
         let q = query(
             "UNWIND $edges AS edge
-             MATCH (c:Class {name: edge.class_name, file: edge.class_file})
-             MATCH (fn:Function {name: edge.func_name, file: edge.func_file})
+             MATCH (c:Class {id: edge.class_id, repo_id: edge.repo_id})
+             MATCH (fn:Function {id: edge.func_id, repo_id: edge.repo_id})
              MERGE (c)-[:CONTAINS]->(fn)"
         )
         .param("edges", chunk.to_vec());
@@ -433,6 +429,7 @@ async fn batch_insert_contains_edges(
 
 async fn batch_insert_calls_edges(
     txn: &mut neo4rs::Txn,
+    repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
 ) -> Result<()> {
@@ -446,20 +443,22 @@ async fn batch_insert_calls_edges(
         if let (NodeId::Function(from_file, from_name), NodeId::Function(to_file, to_name)) = 
             (&edge.from, &edge.to) 
         {
-            edges.push(edge_4_map(
-                "from_file", from_file,
-                "from_name", from_name,
-                "to_file", to_file,
-                "to_name", to_name
-            ));
+            let from_id = get_qualified_id(from_file, from_name);
+            let to_id = get_qualified_id(to_file, to_name);
+            
+            let mut m = HashMap::new();
+            m.insert("from_id".to_string(), from_id);
+            m.insert("to_id".to_string(), to_id);
+            m.insert("repo_id".to_string(), repo_id.to_string());
+            edges.push(m);
         }
     }
 
     for chunk in edges.chunks(batch_size) {
         let q = query(
             "UNWIND $edges AS edge
-             MATCH (from:Function {name: edge.from_name, file: edge.from_file})
-             MATCH (to:Function {name: edge.to_name, file: edge.to_file})
+             MATCH (from:Function {id: edge.from_id, repo_id: edge.repo_id})
+             MATCH (to:Function {id: edge.to_id, repo_id: edge.repo_id})
              MERGE (from)-[:CALLS]->(to)"
         )
         .param("edges", chunk.to_vec());
@@ -473,6 +472,7 @@ async fn batch_insert_calls_edges(
 
 async fn batch_insert_imports_edges(
     txn: &mut neo4rs::Txn,
+    repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
 ) -> Result<()> {
@@ -484,15 +484,19 @@ async fn batch_insert_imports_edges(
         }
         
         if let (NodeId::File(file_path), NodeId::Module(module_name)) = (&edge.from, &edge.to) {
-            edges.push(edge_2_map("file_path", file_path, "module_name", module_name));
+            let mut m = HashMap::new();
+            m.insert("file_path".to_string(), file_path.to_string());
+            m.insert("module_name".to_string(), module_name.to_string());
+            m.insert("repo_id".to_string(), repo_id.to_string());
+            edges.push(m);
         }
     }
 
     for chunk in edges.chunks(batch_size) {
         let q = query(
             "UNWIND $edges AS edge
-             MATCH (f:File {path: edge.file_path})
-             MATCH (m:Module {name: edge.module_name})
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (m:Module {name: edge.module_name, repo_id: edge.repo_id})
              MERGE (f)-[:IMPORTS]->(m)"
         )
         .param("edges", chunk.to_vec());
@@ -506,6 +510,7 @@ async fn batch_insert_imports_edges(
 
 async fn batch_insert_inherits_edges(
     txn: &mut neo4rs::Txn,
+    repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
 ) -> Result<()> {
@@ -519,19 +524,23 @@ async fn batch_insert_inherits_edges(
         
         match (&edge.from, &edge.to) {
             (NodeId::Class(from_file, from_name), NodeId::Class(to_file, to_name)) => {
-                class_to_class.push(edge_4_map(
-                    "from_file", from_file,
-                    "from_name", from_name,
-                    "to_file", to_file,
-                    "to_name", to_name
-                ));
+                let from_id = get_qualified_id(from_file, from_name);
+                let to_id = get_qualified_id(to_file, to_name);
+                
+                let mut m = HashMap::new();
+                m.insert("from_id".to_string(), from_id);
+                m.insert("to_id".to_string(), to_id);
+                m.insert("repo_id".to_string(), repo_id.to_string());
+                class_to_class.push(m);
             }
             (NodeId::Class(class_file, class_name), NodeId::Module(module_name)) => {
-                class_to_module.push(edge_3_map(
-                    "class_file", class_file,
-                    "class_name", class_name,
-                    "module_name", module_name
-                ));
+                let class_id = get_qualified_id(class_file, class_name);
+                
+                let mut m = HashMap::new();
+                m.insert("class_id".to_string(), class_id);
+                m.insert("module_name".to_string(), module_name.to_string());
+                m.insert("repo_id".to_string(), repo_id.to_string());
+                class_to_module.push(m);
             }
             _ => {}
         }
@@ -541,8 +550,8 @@ async fn batch_insert_inherits_edges(
     for chunk in class_to_class.chunks(batch_size) {
         let q = query(
             "UNWIND $edges AS edge
-             MATCH (child:Class {name: edge.from_name, file: edge.from_file})
-             MATCH (parent:Class {name: edge.to_name, file: edge.to_file})
+             MATCH (child:Class {id: edge.from_id, repo_id: edge.repo_id})
+             MATCH (parent:Class {id: edge.to_id, repo_id: edge.repo_id})
              MERGE (child)-[:INHERITS]->(parent)"
         )
         .param("edges", chunk.to_vec());
@@ -554,8 +563,8 @@ async fn batch_insert_inherits_edges(
     for chunk in class_to_module.chunks(batch_size) {
         let q = query(
             "UNWIND $edges AS edge
-             MATCH (child:Class {name: edge.class_name, file: edge.class_file})
-             MATCH (parent:Module {name: edge.module_name})
+             MATCH (child:Class {id: edge.class_id, repo_id: edge.repo_id})
+             MATCH (parent:Module {name: edge.module_name, repo_id: edge.repo_id})
              MERGE (child)-[:INHERITS]->(parent)"
         )
         .param("edges", chunk.to_vec());
@@ -639,6 +648,15 @@ mod tests {
         assert!(map.contains_key("repo_id"));
         assert!(map.contains_key("job_id"));
         assert!(map.contains_key("id"));
+    }
+    #[test]
+    fn test_qualified_id_generation() {
+        let file = "src/main.rs";
+        let name = "MyClass";
+        // Verify format is file::name
+        let expected = "src/main.rs::MyClass";
+        
+        assert_eq!(get_qualified_id(file, name), expected);
     }
 }
 
