@@ -4,6 +4,7 @@ mod parsers;
 mod git_analyzer;
 mod boundary_detector;
 mod dependency_metadata;
+mod communication_detector;
 
 use anyhow::{Context, Result};
 use parsers::{
@@ -472,6 +473,16 @@ async fn analyze_repository(
         error!("Failed to update progress to 60%: {:?}", e);
     }
 
+    // Step 5c: Detect communication patterns
+    let communication_analysis = communication_detector::CommunicationDetector::detect(&temp_repo.path, &parsed_files)?;
+    info!(
+        "Detected communication artifacts: {} endpoints, {} rpc services, {} queue usages, {} compose services",
+        communication_analysis.endpoints.len(),
+        communication_analysis.rpc_services.len(),
+        communication_analysis.queues.len(),
+        communication_analysis.compose_services.len()
+    );
+
     // Step 6: Build dependency graph
     let dep_graph = graph_builder::DependencyGraph::from_parsed_files(&parsed_files, &symbol_table);
     let stats = dep_graph.stats();
@@ -499,6 +510,7 @@ async fn analyze_repository(
         git_contributions.as_ref(),
         &boundary_result,
         &library_dependencies,
+        &communication_analysis,
         None
     ).await?;
     info!("💾 Stored graph data in Neo4j (batch mode)");

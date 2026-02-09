@@ -2,11 +2,13 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List, Optional
+import json
 import os
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 import networkx as nx
 import logging
+import boto3
 
 # Load environment variables
 load_dotenv()
@@ -148,6 +150,64 @@ async def check_repo_exists(session, repo_id: str) -> bool:
     except Exception as e:
         logger.error(f"Error checking repo existence: {e}")
         return False
+
+
+def call_bedrock_claude(prompt: str) -> str:
+    model_id = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0")
+    region = os.getenv("AWS_REGION", "us-east-1")
+
+    client = boto3.client("bedrock-runtime", region_name=region)
+    payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 900,
+        "temperature": 0.2,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+    }
+
+    response = client.invoke_model(
+        modelId=model_id,
+        body=json.dumps(payload),
+        accept="application/json",
+        contentType="application/json",
+    )
+
+    body = response.get("body")
+    if hasattr(body, "read"):
+        body = body.read()
+
+    data = json.loads(body)
+    content = data.get("content", [])
+    if isinstance(content, list) and content:
+        return content[0].get("text", "").strip()
+
+    return data.get("completion", "").strip()
+
+
+def build_architecture_prompt(repo_id: str, metrics: Dict, endpoints: List[Dict], queues: List[Dict], rpc_services: List[Dict]) -> str:
+    prompt = [
+        "You are an architecture analysis assistant.",
+        f"Repository ID: {repo_id}",
+        "Summarize module boundaries, key dependencies, and communication paths.",
+        "Provide risks and suggestions for refactoring.",
+        "",
+        "Metrics:",
+        json.dumps(metrics, indent=2),
+        "",
+        "HTTP Endpoints:",
+        json.dumps(endpoints[:20], indent=2),
+        "",
+        "Message Queues:",
+        json.dumps(queues[:20], indent=2),
+        "",
+        "RPC Services:",
+        json.dumps(rpc_services[:20], indent=2),
+    ]
+    return "\n".join(prompt)
 
 
 async def get_total_count(session, query: str, repo_id: str) -> int:
@@ -765,6 +825,164 @@ async def get_dependencies(
             
     except Exception as e:
         logger.error(f"Error retrieving dependencies: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/graph/{repo_id}/communication")
+async def get_communication(repo_id: str):
+    """
+    Get detected communication paths (HTTP, RPC, message queues, and compose services).
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+
+    try:
+        with neo4j_driver.session() as session:
+            endpoints_query = """
+            MATCH (e:Endpoint {repo_id: $repo_id})
+            OPTIONAL MATCH (f:File)-[:CALLS_ENDPOINT]->(e)
+            OPTIONAL MATCH (e)-[:EXPOSED_BY]->(s:ComposeService)
+            RETURN e.url as url,
+                   e.method as method,
+                   e.host as host,
+                   collect(distinct f.path) as callers,
+                   collect(distinct s.name) as services
+            ORDER BY e.url
+            """
+
+            rpc_query = """
+            MATCH (r:RpcService {repo_id: $repo_id})
+            OPTIONAL MATCH (f:File)-[:CALLS_RPC]->(r)
+            RETURN r.name as name,
+                   collect(distinct f.path) as callers
+            ORDER BY r.name
+            """
+
+            queues_query = """
+            MATCH (q:MessageQueue {repo_id: $repo_id})
+            OPTIONAL MATCH (p:File)-[:PUBLISHES_TO]->(q)
+            OPTIONAL MATCH (c:File)-[:CONSUMES_FROM]->(q)
+            RETURN q.topic as topic,
+                   collect(distinct p.path) as publishers,
+                   collect(distinct c.path) as consumers
+            ORDER BY q.topic
+            """
+
+            compose_query = """
+            MATCH (s:ComposeService {repo_id: $repo_id})
+            RETURN s.name as name,
+                   s.ports as ports
+            ORDER BY s.name
+            """
+
+            endpoints = [dict(record) for record in session.run(endpoints_query, repo_id=repo_id)]
+            rpc_services = [dict(record) for record in session.run(rpc_query, repo_id=repo_id)]
+            queues = [dict(record) for record in session.run(queues_query, repo_id=repo_id)]
+            compose_services = [dict(record) for record in session.run(compose_query, repo_id=repo_id)]
+
+            logger.info(
+                "Retrieved communication data for repo %s: %d endpoints, %d rpc services, %d queues",
+                repo_id,
+                len(endpoints),
+                len(rpc_services),
+                len(queues),
+            )
+
+            return {
+                "repo_id": repo_id,
+                "endpoints": endpoints,
+                "rpc_services": rpc_services,
+                "queues": queues,
+                "compose_services": compose_services,
+            }
+    except Exception as e:
+        logger.error(f"Error retrieving communication data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/graph/{repo_id}/analysis")
+async def get_architecture_analysis(repo_id: str, refresh: bool = False):
+    """
+    Generate or retrieve architecture analysis using AWS Bedrock.
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+
+    try:
+        with neo4j_driver.session() as session:
+            if not refresh:
+                existing = session.run(
+                    "MATCH (a:ArchitectureAnalysis {repo_id: $repo_id}) RETURN a.summary as summary, a.model as model, a.created_at as created_at LIMIT 1",
+                    repo_id=repo_id,
+                ).single()
+
+                if existing and existing.get("summary"):
+                    return {
+                        "repo_id": repo_id,
+                        "model": existing.get("model"),
+                        "summary": existing.get("summary"),
+                        "created_at": str(existing.get("created_at")),
+                        "cached": True,
+                    }
+
+            metrics_query = """
+            MATCH (n)
+            WHERE (n.repo_id = $repo_id OR n.job_id = $repo_id)
+            RETURN
+                sum(CASE WHEN n:File THEN 1 ELSE 0 END) as files,
+                sum(CASE WHEN n:Class THEN 1 ELSE 0 END) as classes,
+                sum(CASE WHEN n:Function THEN 1 ELSE 0 END) as functions,
+                sum(CASE WHEN n:Endpoint THEN 1 ELSE 0 END) as endpoints,
+                sum(CASE WHEN n:RpcService THEN 1 ELSE 0 END) as rpc_services,
+                sum(CASE WHEN n:MessageQueue THEN 1 ELSE 0 END) as queues,
+                sum(CASE WHEN n:ComposeService THEN 1 ELSE 0 END) as compose_services
+            """
+
+            metrics_record = session.run(metrics_query, repo_id=repo_id).single()
+            metrics = dict(metrics_record) if metrics_record else {}
+
+            endpoints = [
+                dict(record)
+                for record in session.run(
+                    "MATCH (e:Endpoint {repo_id: $repo_id}) RETURN e.url as url, e.method as method, e.host as host LIMIT 50",
+                    repo_id=repo_id,
+                )
+            ]
+
+            queues = [
+                dict(record)
+                for record in session.run(
+                    "MATCH (q:MessageQueue {repo_id: $repo_id}) RETURN q.topic as topic LIMIT 50",
+                    repo_id=repo_id,
+                )
+            ]
+
+            rpc_services = [
+                dict(record)
+                for record in session.run(
+                    "MATCH (r:RpcService {repo_id: $repo_id}) RETURN r.name as name LIMIT 50",
+                    repo_id=repo_id,
+                )
+            ]
+
+            prompt = build_architecture_prompt(repo_id, metrics, endpoints, queues, rpc_services)
+            summary = call_bedrock_claude(prompt)
+
+            session.run(
+                "MERGE (a:ArchitectureAnalysis {repo_id: $repo_id}) SET a.summary = $summary, a.model = $model, a.created_at = datetime()",
+                repo_id=repo_id,
+                summary=summary,
+                model=os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"),
+            )
+
+            return {
+                "repo_id": repo_id,
+                "model": os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"),
+                "summary": summary,
+                "cached": False,
+            }
+    except Exception as e:
+        logger.error(f"Error retrieving architecture analysis: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

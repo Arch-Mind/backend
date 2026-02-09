@@ -8,9 +8,10 @@ use crate::parsers::{FunctionInfo, ParsedFile};
 use crate::git_analyzer::RepoContributions;
 use crate::boundary_detector::BoundaryDetectionResult;
 use crate::dependency_metadata::LibraryDependency;
+use crate::communication_detector::{CommunicationAnalysis, QueueDirection};
 use anyhow::{Context, Result};
 use neo4rs::query;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
 // ============================================================================
@@ -104,6 +105,7 @@ pub async fn store_graph(
     git_contributions: Option<&RepoContributions>,
     boundary_result: &BoundaryDetectionResult,
     library_dependencies: &[LibraryDependency],
+    communication_analysis: &CommunicationAnalysis,
     config: Option<BatchConfig>,
 ) -> Result<()> {
     let config = config.unwrap_or_default();
@@ -122,6 +124,7 @@ pub async fn store_graph(
         git_contributions,
         boundary_result,
         library_dependencies,
+        communication_analysis,
         &config
     ).await;
 
@@ -148,6 +151,7 @@ async fn execute_batch_operations(
     git_contributions: Option<&RepoContributions>,
     boundary_result: &BoundaryDetectionResult,
     library_dependencies: &[LibraryDependency],
+    communication_analysis: &CommunicationAnalysis,
     config: &BatchConfig,
 ) -> Result<()> {
     // 1. Create Job node
@@ -183,6 +187,16 @@ async fn execute_batch_operations(
     // 4d. Batch insert service communication edges
     batch_insert_service_nodes(txn, repo_id, parsed_files, config.batch_size).await?;
     batch_insert_service_edges(txn, repo_id, parsed_files, config.batch_size).await?;
+
+    // 4e. Batch insert communication nodes and edges
+    batch_insert_endpoint_nodes(txn, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_endpoint_edges(txn, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_rpc_nodes(txn, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_rpc_edges(txn, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_queue_nodes(txn, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_queue_edges(txn, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_compose_service_nodes(txn, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_endpoint_service_edges(txn, repo_id, communication_analysis, config.batch_size).await?;
     
     // 5. Create file-to-file dependency edges based on imports
     batch_insert_file_dependencies(txn, repo_id, parsed_files, config.batch_size).await?;
@@ -626,6 +640,298 @@ async fn batch_insert_service_edges(
     }
 
     info!("   Created {} CALLS_SERVICE edges", edges.len());
+    Ok(())
+}
+
+async fn batch_insert_endpoint_nodes(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    communication_analysis: &CommunicationAnalysis,
+    batch_size: usize,
+) -> Result<()> {
+    let mut nodes: Vec<BoltMap> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for endpoint in &communication_analysis.endpoints {
+        let key = format!("{}::{}", endpoint.method, endpoint.url);
+        if seen.insert(key) {
+            let mut m = HashMap::new();
+            m.insert("url".to_string(), endpoint.url.clone());
+            m.insert("method".to_string(), endpoint.method.clone());
+            m.insert("host".to_string(), endpoint.host.clone().unwrap_or_default());
+            m.insert("repo_id".to_string(), repo_id.to_string());
+            nodes.push(m);
+        }
+    }
+
+    for chunk in nodes.chunks(batch_size) {
+        let q = query(
+            "UNWIND $nodes AS node
+             MERGE (e:Endpoint {url: node.url, method: node.method, repo_id: node.repo_id})
+             SET e.host = node.host"
+        )
+        .param("nodes", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert Endpoint nodes")?;
+    }
+
+    info!("   Inserted {} Endpoint nodes", nodes.len());
+    Ok(())
+}
+
+async fn batch_insert_endpoint_edges(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    communication_analysis: &CommunicationAnalysis,
+    batch_size: usize,
+) -> Result<()> {
+    let mut edges: Vec<BoltMap> = Vec::new();
+
+    for endpoint in &communication_analysis.endpoints {
+        let mut m = HashMap::new();
+        m.insert("file_path".to_string(), endpoint.file_path.clone());
+        m.insert("url".to_string(), endpoint.url.clone());
+        m.insert("method".to_string(), endpoint.method.clone());
+        m.insert("repo_id".to_string(), repo_id.to_string());
+        edges.push(m);
+    }
+
+    for chunk in edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (e:Endpoint {url: edge.url, method: edge.method, repo_id: edge.repo_id})
+             MERGE (f)-[:CALLS_ENDPOINT]->(e)"
+        )
+        .param("edges", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert CALLS_ENDPOINT edges")?;
+    }
+
+    info!("   Created {} CALLS_ENDPOINT edges", edges.len());
+    Ok(())
+}
+
+async fn batch_insert_rpc_nodes(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    communication_analysis: &CommunicationAnalysis,
+    batch_size: usize,
+) -> Result<()> {
+    let mut nodes: Vec<BoltMap> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for rpc in &communication_analysis.rpc_services {
+        if seen.insert(rpc.service_name.clone()) {
+            let mut m = HashMap::new();
+            m.insert("name".to_string(), rpc.service_name.clone());
+            m.insert("repo_id".to_string(), repo_id.to_string());
+            nodes.push(m);
+        }
+    }
+
+    for chunk in nodes.chunks(batch_size) {
+        let q = query(
+            "UNWIND $nodes AS node
+             MERGE (r:RpcService {name: node.name, repo_id: node.repo_id})"
+        )
+        .param("nodes", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert RpcService nodes")?;
+    }
+
+    info!("   Inserted {} RpcService nodes", nodes.len());
+    Ok(())
+}
+
+async fn batch_insert_rpc_edges(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    communication_analysis: &CommunicationAnalysis,
+    batch_size: usize,
+) -> Result<()> {
+    let mut edges: Vec<BoltMap> = Vec::new();
+
+    for rpc in &communication_analysis.rpc_services {
+        let mut m = HashMap::new();
+        m.insert("file_path".to_string(), rpc.file_path.clone());
+        m.insert("service_name".to_string(), rpc.service_name.clone());
+        m.insert("repo_id".to_string(), repo_id.to_string());
+        edges.push(m);
+    }
+
+    for chunk in edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (r:RpcService {name: edge.service_name, repo_id: edge.repo_id})
+             MERGE (f)-[:CALLS_RPC]->(r)"
+        )
+        .param("edges", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert CALLS_RPC edges")?;
+    }
+
+    info!("   Created {} CALLS_RPC edges", edges.len());
+    Ok(())
+}
+
+async fn batch_insert_queue_nodes(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    communication_analysis: &CommunicationAnalysis,
+    batch_size: usize,
+) -> Result<()> {
+    let mut nodes: Vec<BoltMap> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for queue in &communication_analysis.queues {
+        if seen.insert(queue.topic.clone()) {
+            let mut m = HashMap::new();
+            m.insert("topic".to_string(), queue.topic.clone());
+            m.insert("repo_id".to_string(), repo_id.to_string());
+            nodes.push(m);
+        }
+    }
+
+    for chunk in nodes.chunks(batch_size) {
+        let q = query(
+            "UNWIND $nodes AS node
+             MERGE (q:MessageQueue {topic: node.topic, repo_id: node.repo_id})"
+        )
+        .param("nodes", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert MessageQueue nodes")?;
+    }
+
+    info!("   Inserted {} MessageQueue nodes", nodes.len());
+    Ok(())
+}
+
+async fn batch_insert_queue_edges(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    communication_analysis: &CommunicationAnalysis,
+    batch_size: usize,
+) -> Result<()> {
+    let mut publish_edges: Vec<BoltMap> = Vec::new();
+    let mut consume_edges: Vec<BoltMap> = Vec::new();
+
+    for queue in &communication_analysis.queues {
+        let mut m = HashMap::new();
+        m.insert("file_path".to_string(), queue.file_path.clone());
+        m.insert("topic".to_string(), queue.topic.clone());
+        m.insert("repo_id".to_string(), repo_id.to_string());
+        match queue.direction {
+            QueueDirection::Publish => publish_edges.push(m),
+            QueueDirection::Consume => consume_edges.push(m),
+        }
+    }
+
+    for chunk in publish_edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (q:MessageQueue {topic: edge.topic, repo_id: edge.repo_id})
+             MERGE (f)-[:PUBLISHES_TO]->(q)"
+        )
+        .param("edges", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert PUBLISHES_TO edges")?;
+    }
+
+    for chunk in consume_edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
+             MATCH (q:MessageQueue {topic: edge.topic, repo_id: edge.repo_id})
+             MERGE (f)-[:CONSUMES_FROM]->(q)"
+        )
+        .param("edges", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert CONSUMES_FROM edges")?;
+    }
+
+    info!(
+        "   Created {} PUBLISHES_TO and {} CONSUMES_FROM edges",
+        publish_edges.len(),
+        consume_edges.len()
+    );
+    Ok(())
+}
+
+async fn batch_insert_compose_service_nodes(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    communication_analysis: &CommunicationAnalysis,
+    batch_size: usize,
+) -> Result<()> {
+    let mut nodes: Vec<HashMap<String, neo4rs::BoltType>> = Vec::new();
+
+    for service in &communication_analysis.compose_services {
+        let mut m: HashMap<String, neo4rs::BoltType> = HashMap::new();
+        m.insert("name".to_string(), service.name.clone().into());
+        m.insert("ports".to_string(), service.ports.clone().into());
+        m.insert("repo_id".to_string(), repo_id.to_string().into());
+        nodes.push(m);
+    }
+
+    for chunk in nodes.chunks(batch_size) {
+        let q = query(
+            "UNWIND $nodes AS node
+             MERGE (s:ComposeService {name: node.name, repo_id: node.repo_id})
+             SET s.ports = node.ports"
+        )
+        .param("nodes", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert ComposeService nodes")?;
+    }
+
+    info!("   Inserted {} ComposeService nodes", nodes.len());
+    Ok(())
+}
+
+async fn batch_insert_endpoint_service_edges(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    communication_analysis: &CommunicationAnalysis,
+    batch_size: usize,
+) -> Result<()> {
+    let mut edges: Vec<BoltMap> = Vec::new();
+    let mut service_names: HashSet<String> = HashSet::new();
+
+    for service in &communication_analysis.compose_services {
+        service_names.insert(service.name.clone());
+    }
+
+    for endpoint in &communication_analysis.endpoints {
+        if let Some(host) = endpoint.host.as_ref() {
+            for service_name in &service_names {
+                if host.contains(service_name) {
+                    let mut m = HashMap::new();
+                    m.insert("url".to_string(), endpoint.url.clone());
+                    m.insert("method".to_string(), endpoint.method.clone());
+                    m.insert("service_name".to_string(), service_name.clone());
+                    m.insert("repo_id".to_string(), repo_id.to_string());
+                    edges.push(m);
+                }
+            }
+        }
+    }
+
+    for chunk in edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (e:Endpoint {url: edge.url, method: edge.method, repo_id: edge.repo_id})
+             MATCH (s:ComposeService {name: edge.service_name, repo_id: edge.repo_id})
+             MERGE (e)-[:EXPOSED_BY]->(s)"
+        )
+        .param("edges", chunk.to_vec());
+
+        txn.run(q).await.context("Failed to batch insert EXPOSED_BY edges")?;
+    }
+
+    info!("   Created {} EXPOSED_BY edges", edges.len());
     Ok(())
 }
 
