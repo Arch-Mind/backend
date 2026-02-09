@@ -616,6 +616,313 @@ async def get_module_boundaries(repo_id: str, boundary_type: Optional[str] = Non
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/graph/{repo_id}/dependencies")
+async def get_dependencies(
+    repo_id: str,
+    file_path: Optional[str] = None,
+    dependency_type: Optional[str] = None
+):
+    """
+    Get import/dependency relationships for a repository or specific file.
+    
+    Query Parameters:
+    - file_path: Filter dependencies for a specific file
+    - dependency_type: Filter by edge type (IMPORTS, CALLS, DEPENDS_ON)
+    
+    Returns dependency mappings with file-to-file and function-call relationships.
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+    
+    try:
+        with neo4j_driver.session() as session:
+            # Build query based on filters
+            where_clauses = ["(f.repo_id = $repo_id OR f.job_id = $repo_id)"]
+            params = {"repo_id": repo_id}
+            
+            if file_path:
+                where_clauses.append("f.path = $file_path")
+                params["file_path"] = file_path
+            
+            # Query for IMPORTS edges (file-to-module dependencies)
+            edge_filter = ""
+            if dependency_type and dependency_type.upper() == "IMPORTS":
+                edge_filter = ":IMPORTS"
+            elif dependency_type and dependency_type.upper() == "CALLS":
+                edge_filter = ":CALLS"
+            elif dependency_type:
+                edge_filter = f":{dependency_type.upper()}"
+            
+            query = f"""
+            MATCH (f:File)-[r{edge_filter}]->(target)
+            WHERE {' AND '.join(where_clauses)}
+            RETURN 
+                f.path as source_file,
+                f.language as source_language,
+                type(r) as relationship_type,
+                CASE 
+                    WHEN target:File THEN target.path
+                    WHEN target:Module THEN target.name
+                    WHEN target:Function THEN target.name
+                    WHEN target:Class THEN target.name
+                    ELSE 'Unknown'
+                END as target_name,
+                labels(target)[0] as target_type
+            ORDER BY f.path, relationship_type
+            """
+            
+            result = session.run(query, **params)
+            
+            # Organize dependencies
+            dependencies = []
+            file_deps_map = {}
+            
+            for record in result:
+                source = record["source_file"]
+                target = record["target_name"]
+                rel_type = record["relationship_type"]
+                target_type = record["target_type"]
+                
+                dep_entry = {
+                    "source_file": source,
+                    "source_language": record["source_language"],
+                    "target": target,
+                    "target_type": target_type,
+                    "relationship": rel_type
+                }
+                dependencies.append(dep_entry)
+                
+                # Build file-level dependency map (only for file-to-file or file-to-module)
+                if target_type in ["File", "Module"]:
+                    if source not in file_deps_map:
+                        file_deps_map[source] = {
+                            "language": record["source_language"],
+                            "imports": [],
+                            "imported_by": []
+                        }
+                    file_deps_map[source]["imports"].append({
+                        "target": target,
+                        "type": target_type
+                    })
+            
+            # Query reverse dependencies if specific file requested
+            reverse_deps = []
+            if file_path:
+                reverse_query = """
+                MATCH (source)-[r]->(target)
+                WHERE (target.path = $file_path OR target.name = $file_path)
+                AND (source.repo_id = $repo_id OR source.job_id = $repo_id)
+                RETURN 
+                    source.path as dependent_file,
+                    source.language as dependent_language,
+                    type(r) as relationship_type,
+                    labels(source)[0] as source_type
+                """
+                reverse_result = session.run(reverse_query, **params)
+                
+                for record in reverse_result:
+                    if record["dependent_file"]:  # Only include if it's a file
+                        reverse_deps.append({
+                            "dependent_file": record["dependent_file"],
+                            "dependent_language": record["dependent_language"],
+                            "relationship": record["relationship_type"],
+                            "source_type": record["source_type"]
+                        })
+            
+            logger.info(f"📊 Retrieved {len(dependencies)} dependencies for repo {repo_id}" + 
+                       (f" (file: {file_path})" if file_path else ""))
+            
+            response = {
+                "repo_id": repo_id,
+                "total_dependencies": len(dependencies),
+                "dependencies": dependencies
+            }
+            
+            if file_path:
+                response["file_path"] = file_path
+                response["reverse_dependencies"] = reverse_deps
+                response["total_reverse_dependencies"] = len(reverse_deps)
+            
+            return response
+            
+    except Exception as e:
+        logger.error(f"Error retrieving dependencies: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/graph/{repo_id}/dependency-tree/{file_path:path}")
+async def get_dependency_tree(repo_id: str, file_path: str, max_depth: int = 3):
+    """
+    Get the full dependency tree for a specific file (recursive dependencies).
+    
+    Query Parameters:
+    - max_depth: Maximum depth to traverse (default: 3)
+    
+    Returns a tree structure showing all transitive dependencies.
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+    
+    try:
+        with neo4j_driver.session() as session:
+            # Use Cypher path query to get dependency tree
+            query = """
+            MATCH path = (f:File {path: $file_path})-[:IMPORTS|CALLS*1..%d]->(target)
+            WHERE (f.repo_id = $repo_id OR f.job_id = $repo_id)
+            WITH path, target, length(path) as depth
+            RETURN 
+                [node in nodes(path) | 
+                    CASE 
+                        WHEN node:File THEN node.path
+                        WHEN node:Module THEN node.name
+                        WHEN node:Function THEN node.name
+                        WHEN node:Class THEN node.name
+                        ELSE 'Unknown'
+                    END
+                ] as dependency_chain,
+                depth,
+                labels(target)[0] as target_type
+            ORDER BY depth, dependency_chain
+            LIMIT 1000
+            """ % max_depth
+            
+            result = session.run(query, repo_id=repo_id, file_path=file_path)
+            
+            paths = []
+            unique_dependencies = set()
+            
+            for record in result:
+                chain = record["dependency_chain"]
+                depth = record["depth"]
+                target_type = record["target_type"]
+                
+                paths.append({
+                    "chain": chain,
+                    "depth": depth,
+                    "target_type": target_type
+                })
+                
+                # Track unique direct and transitive dependencies
+                for dep in chain[1:]:  # Skip the source file itself
+                    unique_dependencies.add(dep)
+            
+            logger.info(f"🌳 Retrieved dependency tree for {file_path} in repo {repo_id}: "
+                       f"{len(paths)} paths, {len(unique_dependencies)} unique dependencies")
+            
+            return {
+                "repo_id": repo_id,
+                "file_path": file_path,
+                "max_depth": max_depth,
+                "total_paths": len(paths),
+                "unique_dependencies": len(unique_dependencies),
+                "dependency_paths": paths,
+                "all_dependencies": sorted(list(unique_dependencies))
+            }
+            
+    except Exception as e:
+        logger.error(f"Error retrieving dependency tree: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/graph/{repo_id}/dependency-graph")
+async def get_full_dependency_graph(repo_id: str, limit: int = 500):
+    """
+    Get the complete dependency graph for visualization.
+    Returns nodes and edges suitable for graph visualization tools.
+    
+    Query Parameters:
+    - limit: Maximum number of edges to return (default: 500)
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+    
+    try:
+        with neo4j_driver.session() as session:
+            # Get all nodes
+            nodes_query = """
+            MATCH (n)
+            WHERE (n.repo_id = $repo_id OR n.job_id = $repo_id)
+            RETURN 
+                CASE 
+                    WHEN n:File THEN n.path
+                    WHEN n:Module THEN n.name
+                    WHEN n:Function THEN n.name
+                    WHEN n:Class THEN n.name
+                    ELSE id(n)
+                END as id,
+                CASE 
+                    WHEN n:File THEN n.path
+                    WHEN n:Module THEN n.name
+                    WHEN n:Function THEN n.name
+                    WHEN n:Class THEN n.name
+                    ELSE 'Unknown'
+                END as label,
+                labels(n)[0] as type,
+                properties(n) as properties
+            LIMIT $limit
+            """
+            
+            # Get all edges
+            edges_query = """
+            MATCH (source)-[r:IMPORTS|CALLS|DEFINES|CONTAINS|INHERITS|BELONGS_TO]->(target)
+            WHERE (source.repo_id = $repo_id OR source.job_id = $repo_id)
+            RETURN 
+                CASE 
+                    WHEN source:File THEN source.path
+                    WHEN source:Module THEN source.name
+                    WHEN source:Function THEN source.name
+                    WHEN source:Class THEN source.name
+                    ELSE id(source)
+                END as source,
+                CASE 
+                    WHEN target:File THEN target.path
+                    WHEN target:Module THEN target.name
+                    WHEN target:Function THEN target.name
+                    WHEN target:Class THEN target.name
+                    WHEN target:Boundary THEN target.name
+                    ELSE id(target)
+                END as target,
+                type(r) as type
+            LIMIT $limit
+            """
+            
+            nodes_result = session.run(nodes_query, repo_id=repo_id, limit=limit)
+            edges_result = session.run(edges_query, repo_id=repo_id, limit=limit)
+            
+            nodes = []
+            edges = []
+            
+            for record in nodes_result:
+                nodes.append({
+                    "id": record["id"],
+                    "label": record["label"],
+                    "type": record["type"],
+                    "properties": record["properties"]
+                })
+            
+            for record in edges_result:
+                edges.append({
+                    "source": record["source"],
+                    "target": record["target"],
+                    "type": record["type"]
+                })
+            
+            logger.info(f"🔗 Retrieved dependency graph for repo {repo_id}: "
+                       f"{len(nodes)} nodes, {len(edges)} edges")
+            
+            return {
+                "repo_id": repo_id,
+                "total_nodes": len(nodes),
+                "total_edges": len(edges),
+                "nodes": nodes,
+                "edges": edges
+            }
+            
+    except Exception as e:
+        logger.error(f"Error retrieving dependency graph: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/pagerank/{repo_id}")
 async def calculate_pagerank(repo_id: str):
     """

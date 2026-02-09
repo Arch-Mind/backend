@@ -165,6 +165,9 @@ async fn execute_batch_operations(
     batch_insert_imports_edges(txn, repo_id, dep_graph, config.batch_size).await?;
     batch_insert_inherits_edges(txn, repo_id, dep_graph, config.batch_size).await?;
     batch_insert_belongs_to_edges(txn, repo_id, boundary_result, config.batch_size).await?;
+    
+    // 5. Create file-to-file dependency edges based on imports
+    batch_insert_file_dependencies(txn, repo_id, parsed_files, config.batch_size).await?;
 
     Ok(())
 }
@@ -712,6 +715,103 @@ async fn batch_insert_belongs_to_edges(
     }
     
     info!("   Created {} BELONGS_TO edges", edges.len());
+    Ok(())
+}
+
+/// Create file-to-file DEPENDS_ON edges based on import resolution
+async fn batch_insert_file_dependencies(
+    txn: &mut neo4rs::Txn,
+    repo_id: &str,
+    parsed_files: &[ParsedFile],
+    batch_size: usize,
+) -> Result<()> {
+    use std::path::Path;
+    use std::collections::HashSet;
+    
+    // Build a map of module names to file paths for resolution
+    let mut module_to_files: HashMap<String, Vec<String>> = HashMap::new();
+    
+    for file in parsed_files {
+        let file_path = Path::new(&file.path);
+        
+        // Extract potential module names from file path
+        // e.g., "src/utils/helper.ts" -> ["utils/helper", "helper"]
+        if let Some(file_stem) = file_path.file_stem() {
+            let stem_str = file_stem.to_string_lossy().to_string();
+            module_to_files.entry(stem_str.clone()).or_default().push(file.path.clone());
+            
+            // Also add parent directory as potential module name
+            if let Some(parent) = file_path.parent() {
+                if let Some(parent_str) = parent.file_name() {
+                    let parent_name = parent_str.to_string_lossy().to_string();
+                    module_to_files.entry(parent_name).or_default().push(file.path.clone());
+                }
+            }
+        }
+    }
+    
+    // Now resolve imports to files
+    let mut edges = Vec::new();
+    let mut resolved_count = 0;
+    
+    for file in parsed_files {
+        for import in &file.imports {
+            // Try to resolve import to a file
+            let mut resolved_files = HashSet::new();
+            
+            // Try exact match
+            if module_to_files.contains_key(import) {
+                resolved_files.extend(module_to_files.get(import).unwrap().clone());
+            }
+            
+            // Try extracting last part of import path (e.g., "./utils/helper" -> "helper")
+            if let Some(last_part) = import.split('/').last() {
+                let clean_part = last_part.trim_start_matches("./").trim_start_matches("../");
+                if module_to_files.contains_key(clean_part) {
+                    resolved_files.extend(module_to_files.get(clean_part).unwrap().clone());
+                }
+            }
+            
+            // Try partial matches for relative imports
+            if import.starts_with("./") || import.starts_with("../") {
+                let import_parts: Vec<&str> = import.split('/').filter(|p| !p.is_empty() && *p != ".." && *p != ".").collect();
+                if let Some(last_part) = import_parts.last() {
+                    if module_to_files.contains_key(*last_part) {
+                        resolved_files.extend(module_to_files.get(*last_part).unwrap().clone());
+                    }
+                }
+            }
+            
+            // Create edges for resolved files (excluding self-imports)
+            for target_file in resolved_files {
+                if target_file != file.path {
+                    let mut m = HashMap::new();
+                    m.insert("source_file".to_string(), file.path.clone());
+                    m.insert("target_file".to_string(), target_file);
+                    m.insert("import_path".to_string(), import.clone());
+                    m.insert("repo_id".to_string(), repo_id.to_string());
+                    edges.push(m);
+                    resolved_count += 1;
+                }
+            }
+        }
+    }
+    
+    // Batch insert edges
+    for chunk in edges.chunks(batch_size) {
+        let q = query(
+            "UNWIND $edges AS edge
+             MATCH (source:File {path: edge.source_file, repo_id: edge.repo_id})
+             MATCH (target:File {path: edge.target_file, repo_id: edge.repo_id})
+             MERGE (source)-[d:DEPENDS_ON]->(target)
+             ON CREATE SET d.import_path = edge.import_path"
+        )
+        .param("edges", chunk.to_vec());
+        
+        txn.run(q).await.context("Failed to batch insert DEPENDS_ON edges")?;
+    }
+    
+    info!("   Created {} DEPENDS_ON edges ({} imports resolved to files)", edges.len(), resolved_count);
     Ok(())
 }
 
