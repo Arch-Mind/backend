@@ -18,7 +18,7 @@ use parsers::{
 };
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,6 +46,42 @@ pub struct JobUpdatePayload {
     pub result_summary: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphPatch {
+    changed_files: Vec<String>,
+    removed_files: Vec<String>,
+    nodes: Vec<PatchNode>,
+    edges: Vec<PatchEdge>,
+}
+
+#[derive(Debug, Serialize)]
+struct PatchNode {
+    id: String,
+    label: String,
+    #[serde(rename = "type")]
+    node_type: String,
+    #[serde(rename = "parentId")]
+    parent_id: Option<String>,
+    extension: Option<String>,
+    language: Option<String>,
+    depth: usize,
+    #[serde(rename = "filePath")]
+    file_path: Option<String>,
+    #[serde(rename = "lineNumber")]
+    line_number: Option<usize>,
+    #[serde(rename = "endLineNumber")]
+    end_line_number: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct PatchEdge {
+    id: String,
+    source: String,
+    target: String,
+    #[serde(rename = "type")]
+    edge_type: String,
 }
 
 pub struct ApiClient {
@@ -403,6 +439,9 @@ async fn analyze_repository(
     let temp_repo = clone_repository(&job.repo_url, &job.branch, &job.options)?;
     info!("📦 Repository cloned to: {:?}", temp_repo.path);
 
+    let (changed_files, removed_files) = extract_webhook_changes(&job.options);
+    let incremental = !changed_files.is_empty() || !removed_files.is_empty();
+
     // Update progress: 25%
     if let Err(e) = api_client.update_job(&job.job_id, JobUpdatePayload {
         status: None,
@@ -414,7 +453,11 @@ async fn analyze_repository(
     }
 
     // Step 2: Parse source files with tree-sitter
-    let parsed_files = parse_repository(&temp_repo.path)?;
+    let parsed_files = if incremental {
+        parse_repository_subset(&temp_repo.path, &changed_files)?
+    } else {
+        parse_repository(&temp_repo.path)?
+    };
     info!("📄 Parsed {} files", parsed_files.len());
 
     // Update progress: 50%
@@ -501,19 +544,37 @@ async fn analyze_repository(
     }
 
     // Step 7: Store in Neo4j (batch operations with transactions)
-    neo4j_storage::store_graph(
-        neo4j_graph, 
-        &job.job_id, 
-        &job.repo_id, 
-        &parsed_files, 
-        &dep_graph, 
-        git_contributions.as_ref(),
-        &boundary_result,
-        &library_dependencies,
-        &communication_analysis,
-        None
-    ).await?;
-    info!("💾 Stored graph data in Neo4j (batch mode)");
+    if incremental {
+        neo4j_storage::store_graph_incremental(
+            neo4j_graph,
+            &job.job_id,
+            &job.repo_id,
+            &parsed_files,
+            &dep_graph,
+            git_contributions.as_ref(),
+            &boundary_result,
+            &library_dependencies,
+            &communication_analysis,
+            &changed_files,
+            &removed_files,
+            None,
+        ).await?;
+        info!("💾 Stored incremental graph update in Neo4j");
+    } else {
+        neo4j_storage::store_graph(
+            neo4j_graph,
+            &job.job_id,
+            &job.repo_id,
+            &parsed_files,
+            &dep_graph,
+            git_contributions.as_ref(),
+            &boundary_result,
+            &library_dependencies,
+            &communication_analysis,
+            None,
+        ).await?;
+        info!("💾 Stored graph data in Neo4j (batch mode)");
+    }
 
     // Update progress: 90%
     if let Err(e) = api_client.update_job(&job.job_id, JobUpdatePayload {
@@ -526,7 +587,7 @@ async fn analyze_repository(
     }
 
     // Create result summary
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "total_files": parsed_files.len(),
         "total_functions": stats.functions,
         "total_classes": stats.classes,
@@ -534,6 +595,11 @@ async fn analyze_repository(
         "complexity_score": 0.0, // Placeholder
         "languages": {} // Placeholder
     });
+
+    if incremental {
+        let patch = build_graph_patch(&parsed_files, &dep_graph, &changed_files, &removed_files);
+        summary["graph_patch"] = serde_json::to_value(patch)?;
+    }
     
     Ok(summary)
 }
@@ -643,6 +709,180 @@ fn parse_repository(repo_path: &std::path::PathBuf) -> Result<Vec<ParsedFile>> {
     
     info!("📄 Successfully parsed {} files", parsed_files.len());
     Ok(parsed_files)
+}
+
+fn parse_repository_subset(repo_path: &PathBuf, files: &[String]) -> Result<Vec<ParsedFile>> {
+    let mut parsed_files = Vec::new();
+
+    let js_parser = JavaScriptParser::new()?;
+    let ts_parser = TypeScriptParser::new()?;
+    let rust_parser = RustParser::new()?;
+    let go_parser = GoParser::new()?;
+    let py_parser = PythonParser::new()?;
+
+    for file in files {
+        let normalized = file.replace("\\", "/");
+        let abs_path = repo_path.join(&normalized);
+        if !abs_path.is_file() {
+            continue;
+        }
+
+        let content = fs::read_to_string(&abs_path)
+            .context(format!("Failed to read file: {:?}", abs_path))?;
+        let relative_path_buf = PathBuf::from(&normalized);
+        let ext = abs_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+        let parsed = match ext.as_str() {
+            "js" | "jsx" | "mjs" => Some(js_parser.parse_file(&relative_path_buf, &content)?),
+            "ts" | "tsx" => Some(ts_parser.parse_file(&relative_path_buf, &content)?),
+            "rs" => Some(rust_parser.parse_file(&relative_path_buf, &content)?),
+            "go" => Some(go_parser.parse_file(&relative_path_buf, &content)?),
+            "py" => Some(py_parser.parse_file(&relative_path_buf, &content)?),
+            _ => None,
+        };
+
+        if let Some(parsed) = parsed {
+            parsed_files.push(parsed);
+        }
+    }
+
+    info!("📄 Incremental parse: {} files", parsed_files.len());
+    Ok(parsed_files)
+}
+
+fn extract_webhook_changes(options: &Option<HashMap<String, String>>) -> (Vec<String>, Vec<String>) {
+    let mut changed_files = Vec::new();
+    let mut removed_files = Vec::new();
+
+    if let Some(opts) = options {
+        if let Some(raw) = opts.get("changed_files") {
+            if let Ok(files) = serde_json::from_str::<Vec<String>>(raw) {
+                changed_files = files;
+            }
+        }
+        if let Some(raw) = opts.get("removed_files") {
+            if let Ok(files) = serde_json::from_str::<Vec<String>>(raw) {
+                removed_files = files;
+            }
+        }
+    }
+
+    (changed_files, removed_files)
+}
+
+fn build_graph_patch(
+    parsed_files: &[ParsedFile],
+    dep_graph: &graph_builder::DependencyGraph,
+    changed_files: &[String],
+    removed_files: &[String],
+) -> GraphPatch {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut module_nodes = HashSet::new();
+
+    for file in parsed_files {
+        let depth = file.path.matches('/').count();
+        let label = file.path.split('/').last().unwrap_or(&file.path).to_string();
+        let extension = Path::new(&file.path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+
+        nodes.push(PatchNode {
+            id: file.path.clone(),
+            label,
+            node_type: "file".to_string(),
+            parent_id: None,
+            extension,
+            language: Some(file.language.clone()),
+            depth,
+            file_path: Some(file.path.clone()),
+            line_number: None,
+            end_line_number: None,
+        });
+
+        for class in &file.classes {
+            nodes.push(PatchNode {
+                id: format!("{}::{}", file.path, class.name),
+                label: class.name.clone(),
+                node_type: "class".to_string(),
+                parent_id: Some(file.path.clone()),
+                extension: None,
+                language: Some(file.language.clone()),
+                depth: depth + 1,
+                file_path: Some(file.path.clone()),
+                line_number: Some(class.start_line),
+                end_line_number: Some(class.end_line),
+            });
+        }
+
+        for func in &file.functions {
+            nodes.push(PatchNode {
+                id: format!("{}::{}", file.path, func.name),
+                label: func.name.clone(),
+                node_type: "function".to_string(),
+                parent_id: Some(file.path.clone()),
+                extension: None,
+                language: Some(file.language.clone()),
+                depth: depth + 2,
+                file_path: Some(file.path.clone()),
+                line_number: Some(func.start_line),
+                end_line_number: Some(func.end_line),
+            });
+        }
+    }
+
+    for edge in &dep_graph.edges {
+        let source = node_id_to_string(&edge.from);
+        let target = node_id_to_string(&edge.to);
+        let edge_type = edge.edge_type.as_str().to_lowercase();
+        let id = format!("{}:{}->{}", edge_type, source, target);
+
+        if let graph_builder::NodeId::Module(name) = &edge.from {
+            module_nodes.insert(name.clone());
+        }
+        if let graph_builder::NodeId::Module(name) = &edge.to {
+            module_nodes.insert(name.clone());
+        }
+
+        edges.push(PatchEdge {
+            id,
+            source,
+            target,
+            edge_type,
+        });
+    }
+
+    for module in module_nodes {
+        nodes.push(PatchNode {
+            id: module.clone(),
+            label: module.clone(),
+            node_type: "module".to_string(),
+            parent_id: None,
+            extension: None,
+            language: None,
+            depth: 0,
+            file_path: None,
+            line_number: None,
+            end_line_number: None,
+        });
+    }
+
+    GraphPatch {
+        changed_files: changed_files.to_vec(),
+        removed_files: removed_files.to_vec(),
+        nodes,
+        edges,
+    }
+}
+
+fn node_id_to_string(node: &graph_builder::NodeId) -> String {
+    match node {
+        graph_builder::NodeId::File(path) => path.clone(),
+        graph_builder::NodeId::Class(path, name) => format!("{}::{}", path, name),
+        graph_builder::NodeId::Function(path, name) => format!("{}::{}", path, name),
+        graph_builder::NodeId::Module(name) => name.clone(),
+    }
 }
 
 fn collect_library_dependencies(repo_path: &PathBuf) -> Result<Vec<LibraryDependency>> {

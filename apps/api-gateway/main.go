@@ -916,6 +916,12 @@ func updateJob(c *gin.Context) {
 	} else if finalStatus == "COMPLETED" || finalStatus == "FAILED" {
 		update.Type = "status"
 	}
+
+	if update.Type != "error" && req.ResultSummary != nil {
+		if _, ok := req.ResultSummary["graph_patch"]; ok {
+			update.Type = "graph_patch"
+		}
+	}
 	
 	wsHub.BroadcastJobUpdate(update)
 
@@ -1261,7 +1267,9 @@ func handlePushEvent(c *gin.Context, body []byte) {
 
 	// Check if any analyzable files were changed
 	changedFiles := collectChangedFiles(payload.Commits)
-	if !hasAnalyzableFiles(changedFiles) {
+	removedFiles := collectRemovedFiles(payload.Commits)
+	allChanged := append(changedFiles, removedFiles...)
+	if !hasAnalyzableFiles(allChanged) {
 		log.Printf("ℹ️ Webhook: No analyzable files changed, skipping analysis")
 		c.JSON(http.StatusOK, WebhookResponse{
 			Status:  "skipped",
@@ -1271,7 +1279,7 @@ func handlePushEvent(c *gin.Context, body []byte) {
 	}
 
 	// Create and queue analysis job
-	jobID, err := createWebhookAnalysisJob(payload.Repository.CloneURL, branch, "push", changedFiles)
+	jobID, err := createWebhookAnalysisJob(payload.Repository.CloneURL, branch, "push", changedFiles, removedFiles)
 	if err != nil {
 		log.Printf("❌ Webhook: Failed to create analysis job: %v", err)
 		c.JSON(http.StatusInternalServerError, WebhookResponse{
@@ -1331,6 +1339,7 @@ func handlePullRequestEvent(c *gin.Context, body []byte) {
 		branch,
 		"pull_request",
 		nil, // PR events don't include file changes, analyze everything
+		nil,
 	)
 	if err != nil {
 		log.Printf("❌ Webhook: Failed to create analysis job: %v", err)
@@ -1381,6 +1390,22 @@ func collectChangedFiles(commits []GitHubCommit) []string {
 	return files
 }
 
+// collectRemovedFiles aggregates removed files from commits
+func collectRemovedFiles(commits []GitHubCommit) []string {
+	fileSet := make(map[string]bool)
+	for _, commit := range commits {
+		for _, file := range commit.Removed {
+			fileSet[file] = true
+		}
+	}
+
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
+	}
+	return files
+}
+
 // hasAnalyzableFiles checks if any of the changed files are code files we can analyze
 func hasAnalyzableFiles(files []string) bool {
 	for _, file := range files {
@@ -1393,7 +1418,7 @@ func hasAnalyzableFiles(files []string) bool {
 }
 
 // createWebhookAnalysisJob creates a new analysis job from a webhook event
-func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []string) (string, error) {
+func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []string, removedFiles []string) (string, error) {
 	jobID := uuid.New().String()
 
 	// Build options with webhook metadata
@@ -1411,6 +1436,18 @@ func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []st
 		}
 		filesJSON, _ := json.Marshal(changedFiles)
 		options["changed_files"] = string(filesJSON)
+		options["analysis_mode"] = "incremental"
+	}
+
+	if len(removedFiles) > 0 {
+		maxFiles := 100
+		if len(removedFiles) > maxFiles {
+			removedFiles = removedFiles[:maxFiles]
+			options["removed_files_truncated"] = "true"
+		}
+		removedJSON, _ := json.Marshal(removedFiles)
+		options["removed_files"] = string(removedJSON)
+		options["analysis_mode"] = "incremental"
 	}
 
 	job := AnalysisJob{

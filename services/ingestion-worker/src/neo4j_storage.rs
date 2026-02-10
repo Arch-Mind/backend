@@ -89,6 +89,50 @@ fn module_node_to_map(name: &str, job_id: &str, repo_id: &str) -> BoltMap {
     m
 }
 
+async fn delete_file_nodes(txn: &mut neo4rs::Txn, repo_id: &str, files: &[String]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    let remove_files = query(
+        "UNWIND $paths AS path
+         MATCH (f:File {id: path, repo_id: $repo_id})
+         DETACH DELETE f"
+    )
+    .param("paths", files.to_vec())
+    .param("repo_id", repo_id);
+
+    txn.run(remove_files)
+        .await
+        .context("Failed to delete file nodes")?;
+
+    let remove_classes = query(
+        "UNWIND $paths AS path
+         MATCH (c:Class {file: path, repo_id: $repo_id})
+         DETACH DELETE c"
+    )
+    .param("paths", files.to_vec())
+    .param("repo_id", repo_id);
+
+    txn.run(remove_classes)
+        .await
+        .context("Failed to delete class nodes")?;
+
+    let remove_functions = query(
+        "UNWIND $paths AS path
+         MATCH (fn:Function {file: path, repo_id: $repo_id})
+         DETACH DELETE fn"
+    )
+    .param("paths", files.to_vec())
+    .param("repo_id", repo_id);
+
+    txn.run(remove_functions)
+        .await
+        .context("Failed to delete function nodes")?;
+
+    Ok(())
+}
+
 
 
 // ============================================================================
@@ -202,6 +246,62 @@ async fn execute_batch_operations(
     batch_insert_file_dependencies(txn, repo_id, parsed_files, config.batch_size).await?;
 
     Ok(())
+}
+
+/// Store an incremental graph update for a subset of files
+pub async fn store_graph_incremental(
+    graph_db: &neo4rs::Graph,
+    job_id: &str,
+    repo_id: &str,
+    parsed_files: &[ParsedFile],
+    dep_graph: &DependencyGraph,
+    git_contributions: Option<&RepoContributions>,
+    boundary_result: &BoundaryDetectionResult,
+    library_dependencies: &[LibraryDependency],
+    communication_analysis: &CommunicationAnalysis,
+    changed_files: &[String],
+    removed_files: &[String],
+    config: Option<BatchConfig>,
+) -> Result<()> {
+    let config = config.unwrap_or_default();
+    info!("💾 Starting incremental Neo4j storage (batch_size={})", config.batch_size);
+
+    let mut txn = graph_db.start_txn().await.context("Failed to start transaction")?;
+
+    let mut files_to_remove = Vec::new();
+    files_to_remove.extend_from_slice(changed_files);
+    files_to_remove.extend_from_slice(removed_files);
+    files_to_remove.sort();
+    files_to_remove.dedup();
+
+    delete_file_nodes(&mut txn, repo_id, &files_to_remove).await?;
+
+    let result = execute_batch_operations(
+        &mut txn,
+        job_id,
+        repo_id,
+        parsed_files,
+        dep_graph,
+        git_contributions,
+        boundary_result,
+        library_dependencies,
+        communication_analysis,
+        &config,
+    )
+    .await;
+
+    match result {
+        Ok(_) => {
+            txn.commit().await.context("Failed to commit transaction")?;
+            info!("✅ Incremental transaction committed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            warn!("❌ Error during incremental insert, rolling back: {}", e);
+            txn.rollback().await.context("Failed to rollback transaction")?;
+            Err(e)
+        }
+    }
 }
 
 // ============================================================================
