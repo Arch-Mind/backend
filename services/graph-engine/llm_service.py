@@ -12,6 +12,7 @@ class LLMSettings:
     model: str
     openai_api_key: Optional[str]
     anthropic_api_key: Optional[str]
+    gemini_api_key: Optional[str]
     ollama_url: str
     aws_region: str
     bedrock_model_id: str
@@ -23,6 +24,7 @@ class LLMSettings:
             model=os.getenv("LLM_MODEL", "gpt-4"),
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+            gemini_api_key=os.getenv("GEMINI_API_KEY"),
             ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
             aws_region=os.getenv("AWS_REGION", "us-east-1"),
             bedrock_model_id=os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"),
@@ -36,6 +38,8 @@ def call_llm(prompt: str, settings: LLMSettings) -> str:
         return call_openai(prompt, settings)
     if provider == "anthropic":
         return call_anthropic(prompt, settings)
+    if provider == "gemini":
+        return call_gemini(prompt, settings)
     if provider == "ollama":
         return call_ollama(prompt, settings)
     if provider == "bedrock":
@@ -135,6 +139,42 @@ def call_bedrock(prompt: str, settings: LLMSettings) -> str:
         return content[0].get("text", "").strip()
 
     return data.get("completion", "").strip()
+
+
+def call_gemini(prompt: str, settings: LLMSettings) -> str:
+    if not settings.gemini_api_key:
+        raise ValueError("GEMINI_API_KEY is required for Gemini provider")
+
+    model = settings.model or "gemini-1.5-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.gemini_api_key}"
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 900,
+        }
+    }
+
+    with httpx.Client(timeout=60) as client:
+        resp = client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        candidates = data.get("candidates", [])
+        if candidates:
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+            if parts:
+                return parts[0].get("text", "").strip()
+        
+        return ""
 
 
 def build_pattern_prompt(summary: Dict[str, Any]) -> str:

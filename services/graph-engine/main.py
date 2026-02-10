@@ -940,7 +940,7 @@ async def analyze_architecture(repo_id: str, refresh: bool = False):
             WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id)
             RETURN type(r) as type, count(*) as count
             """
-            dep_counts = [dict(record) for record in session.run(deps_query)]
+            dep_counts = [dict(record) for record in session.run(deps_query, repo_id=repo_id)]
 
             files_count = session.run(
                 "MATCH (f:File) WHERE f.repo_id = $repo_id OR f.job_id = $repo_id RETURN count(f) as count",
