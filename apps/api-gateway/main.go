@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -106,6 +108,72 @@ type WebhookResponse struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
 	JobID   string `json:"job_id,omitempty"`
+}
+
+// WebhookConfig represents stored webhook configuration
+type WebhookConfig struct {
+	ID        int       `json:"id"`
+	RepoID    int       `json:"repo_id"`
+	RepoURL   string    `json:"repo_url,omitempty"`
+	URL       string    `json:"url"`
+	Secret    *string   `json:"secret,omitempty"`
+	Events    []string  `json:"events"`
+	Active    bool      `json:"active"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// WebhookCreateRequest represents incoming webhook configuration
+type WebhookCreateRequest struct {
+	RepoID  *int     `json:"repo_id,omitempty"`
+	RepoURL string   `json:"repo_url,omitempty"`
+	URL     string   `json:"url"`
+	Secret  string   `json:"secret,omitempty"`
+	Events  []string `json:"events"`
+}
+
+type WebhookListResponse struct {
+	Webhooks []WebhookConfig `json:"webhooks"`
+}
+
+// ExportRequest represents export request parameters
+type ExportRequest struct {
+	Formats          []string `json:"formats"`
+	IncludeLLMSummary bool     `json:"include_llm_summary"`
+	IncludeHeatmap    bool     `json:"include_heatmap"`
+	MaxNodes          int      `json:"max_nodes"`
+	MaxEdges          int      `json:"max_edges"`
+}
+
+// ExportResponse represents server-side export payload
+type ExportResponse struct {
+	RepoID   string                 `json:"repo_id"`
+	Exports  map[string]interface{} `json:"exports"`
+	Warnings []string               `json:"warnings,omitempty"`
+}
+
+// Graph engine response types
+type GraphEngineNode struct {
+	ID    string                 `json:"id"`
+	Label string                 `json:"label"`
+	Type  string                 `json:"type"`
+	Props map[string]interface{} `json:"properties"`
+}
+
+type GraphEngineEdge struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+	Type   string `json:"type"`
+}
+
+type GraphEngineGraphResponse struct {
+	Nodes     []GraphEngineNode `json:"nodes"`
+	Edges     []GraphEngineEdge `json:"edges"`
+	TotalNodes int              `json:"total_nodes"`
+	TotalEdges int              `json:"total_edges"`
+	Limit     int              `json:"limit"`
+	Offset    int              `json:"offset"`
+	HasMore   bool             `json:"has_more"`
 }
 
 // Supported file extensions for code analysis
@@ -582,7 +650,16 @@ func setupRouter() *gin.Engine {
 		// Repository management
 		v1.GET("/repositories", listRepositories)
 		v1.GET("/repositories/:id", getRepository)
+
+		// Webhook management
+		v1.GET("/webhooks", listWebhooks)
+		v1.POST("/webhooks", createWebhook)
+		v1.DELETE("/webhooks/:id", deleteWebhook)
+		v1.POST("/webhooks/:id/ping", pingWebhook)
 	}
+
+	// Export endpoint
+	router.POST("/api/export/:repo_id", exportRepository)
 
 	return router
 }
@@ -1061,6 +1138,309 @@ func getRepository(c *gin.Context) {
 	})
 }
 
+// listWebhooks returns configured webhooks
+func listWebhooks(c *gin.Context) {
+	rows, err := db.Query(`
+		SELECT w.id, w.repo_id, r.url, w.url, w.secret, w.events, w.active, w.created_at, w.updated_at
+		FROM webhooks w
+		JOIN repositories r ON w.repo_id = r.id
+		ORDER BY w.created_at DESC
+	`)
+	if err != nil {
+		log.Printf("Database error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to retrieve webhooks",
+		})
+		return
+	}
+	defer rows.Close()
+
+	webhooks := []WebhookConfig{}
+	for rows.Next() {
+		var hook WebhookConfig
+		var secret sql.NullString
+		var eventsJSON []byte
+		if err := rows.Scan(&hook.ID, &hook.RepoID, &hook.RepoURL, &hook.URL, &secret, &eventsJSON, &hook.Active, &hook.CreatedAt, &hook.UpdatedAt); err != nil {
+			log.Printf("Scan error: %v", err)
+			continue
+		}
+		if secret.Valid {
+			value := secret.String
+			hook.Secret = &value
+		}
+		if len(eventsJSON) > 0 {
+			_ = json.Unmarshal(eventsJSON, &hook.Events)
+		}
+		webhooks = append(webhooks, hook)
+	}
+
+	c.JSON(http.StatusOK, WebhookListResponse{Webhooks: webhooks})
+}
+
+// createWebhook stores a webhook configuration
+func createWebhook(c *gin.Context) {
+	var req WebhookCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request body",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	if req.URL == "" {
+		validationError(c, "url", "Webhook URL is required")
+		return
+	}
+
+	if req.RepoID == nil && req.RepoURL == "" {
+		validationError(c, "repo_url", "Repository URL is required")
+		return
+	}
+
+	if req.RepoURL != "" && !validateRepoURL(req.RepoURL) {
+		validationError(c, "repo_url", "Invalid git repository URL format")
+		return
+	}
+
+	repoID := 0
+	if req.RepoID != nil {
+		repoID = *req.RepoID
+	} else {
+		id, err := getOrCreateRepository(req.RepoURL)
+		if err != nil {
+			log.Printf("Repository error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to resolve repository",
+			})
+			return
+		}
+		repoID = id
+	}
+
+	events := req.Events
+	if len(events) == 0 {
+		events = []string{"push", "pull_request"}
+	}
+	var eventsJSON []byte
+	eventsJSON, _ = json.Marshal(events)
+
+	var createdAt time.Time
+	var updatedAt time.Time
+	var id int
+	var secret *string
+	if req.Secret != "" {
+		secret = &req.Secret
+	}
+
+	err := db.QueryRow(`
+		INSERT INTO webhooks (user_id, repo_id, url, secret, events, active)
+		VALUES ($1, $2, $3, $4, $5, true)
+		RETURNING id, created_at, updated_at
+	`, 1, repoID, req.URL, req.Secret, eventsJSON).Scan(&id, &createdAt, &updatedAt)
+
+	if err != nil {
+		log.Printf("Database error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to create webhook",
+		})
+		return
+	}
+
+	repoURL := req.RepoURL
+	if repoURL == "" {
+		repoURL = lookupRepoURL(repoID)
+	}
+
+	c.JSON(http.StatusCreated, WebhookConfig{
+		ID:        id,
+		RepoID:    repoID,
+		RepoURL:   repoURL,
+		URL:       req.URL,
+		Secret:    secret,
+		Events:    events,
+		Active:    true,
+		CreatedAt: createdAt,
+		UpdatedAt: updatedAt,
+	})
+}
+
+// deleteWebhook deletes a webhook by ID
+func deleteWebhook(c *gin.Context) {
+	idParam := c.Param("id")
+	id, err := strconv.Atoi(idParam)
+	if err != nil {
+		validationError(c, "id", "Invalid webhook ID")
+		return
+	}
+
+	result, err := db.Exec("DELETE FROM webhooks WHERE id = $1", id)
+	if err != nil {
+		log.Printf("Database error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to delete webhook",
+		})
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Webhook not found",
+		})
+		return
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+// pingWebhook sends a test payload to the webhook URL
+func pingWebhook(c *gin.Context) {
+	idParam := c.Param("id")
+	id, err := strconv.Atoi(idParam)
+	if err != nil {
+		validationError(c, "id", "Invalid webhook ID")
+		return
+	}
+
+	var url string
+	var secret sql.NullString
+	err = db.QueryRow("SELECT url, secret FROM webhooks WHERE id = $1", id).Scan(&url, &secret)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Webhook not found",
+		})
+		return
+	} else if err != nil {
+		log.Printf("Database error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to load webhook",
+		})
+		return
+	}
+
+	payload := map[string]interface{}{
+		"zen":      "ArchMind webhook test",
+		"hook_id":  id,
+		"sent_at":  time.Now().UTC().Format(time.RFC3339),
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to build ping request",
+		})
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Event", "ping")
+	req.Header.Set("X-GitHub-Delivery", uuid.New().String())
+	req.Header.Set("User-Agent", "ArchMind-Webhook")
+	if secret.Valid {
+		signature := signGitHubPayload(body, secret.String)
+		if signature != "" {
+			req.Header.Set("X-Hub-Signature-256", signature)
+		}
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "Webhook ping failed",
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		bodyText, _ := io.ReadAll(resp.Body)
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":   "Webhook ping returned error",
+			"details": string(bodyText),
+			"status":  resp.StatusCode,
+		})
+		return
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+// exportRepository builds export payloads from graph engine data
+func exportRepository(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	if !validateUUID(repoID) {
+		validationError(c, "repo_id", "Invalid repository ID")
+		return
+	}
+
+	var req ExportRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.Formats = []string{}
+	}
+
+	formats := req.Formats
+	if len(formats) == 0 {
+		formats = []string{"json", "mermaid", "plantuml"}
+	}
+
+	maxNodes := req.MaxNodes
+	if maxNodes <= 0 {
+		maxNodes = 5000
+	}
+
+	graphURL := getEnv("GRAPH_ENGINE_URL", "http://localhost:8000")
+
+	graph, warnings, err := fetchGraphEngineGraph(graphURL, repoID, maxNodes)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":   "Failed to fetch graph",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	exports := map[string]interface{}{}
+	if containsFormat(formats, "json") {
+		exports["json"] = graph
+	}
+	if containsFormat(formats, "mermaid") {
+		exports["mermaid"] = buildMermaid(graph)
+	}
+	if containsFormat(formats, "plantuml") {
+		exports["plantuml"] = buildPlantUML(graph)
+	}
+	if containsFormat(formats, "markdown") {
+		exports["markdown"] = buildMarkdownExport(graph)
+	}
+
+	if req.IncludeHeatmap {
+		heatmap, err := fetchGraphEngineJSON(graphURL, fmt.Sprintf("/api/graph/%s/contributions", repoID))
+		if err != nil {
+			warnings = append(warnings, "heatmap_unavailable")
+		} else {
+			exports["heatmap"] = heatmap
+		}
+	}
+
+	if req.IncludeLLMSummary {
+		insights, err := fetchGraphEngineJSON(graphURL, fmt.Sprintf("/api/analyze/%s/architecture", repoID))
+		if err != nil {
+			warnings = append(warnings, "llm_summary_unavailable")
+		} else {
+			exports["llm_summary"] = insights
+		}
+	}
+
+	c.JSON(http.StatusOK, ExportResponse{
+		RepoID:   repoID,
+		Exports:  exports,
+		Warnings: warnings,
+	})
+}
+
 // storeJob stores an analysis job in PostgreSQL
 func storeJob(job AnalysisJob) error {
 	optionsJSON, err := json.Marshal(job.Options)
@@ -1193,9 +1573,13 @@ func handleGitHubWebhook(c *gin.Context) {
 		return
 	}
 
-	// Step 2: Verify the signature (security check)
+	// Step 2: Determine event type and resolve secret
+	eventType := c.GetHeader("X-GitHub-Event")
+	secretOverride := resolveWebhookSecret(eventType, body)
+
+	// Step 3: Verify the signature (security check)
 	signature := c.GetHeader("X-Hub-Signature-256")
-	if !verifyGitHubSignature(body, signature) {
+	if !verifyGitHubSignature(body, signature, secretOverride) {
 		log.Printf("❌ Webhook: Invalid signature from IP: %s", c.ClientIP())
 		c.JSON(http.StatusUnauthorized, WebhookResponse{
 			Status:  "error",
@@ -1204,13 +1588,12 @@ func handleGitHubWebhook(c *gin.Context) {
 		return
 	}
 
-	// Step 3: Check the event type
-	eventType := c.GetHeader("X-GitHub-Event")
+	// Step 4: Check the event type
 	deliveryID := c.GetHeader("X-GitHub-Delivery")
 
 	log.Printf("📥 Webhook received: event=%s, delivery=%s", eventType, deliveryID)
 
-	// Step 4: Route to appropriate handler based on event type
+	// Step 5: Route to appropriate handler based on event type
 	switch eventType {
 	case "push":
 		handlePushEvent(c, body)
@@ -1234,10 +1617,13 @@ func handleGitHubWebhook(c *gin.Context) {
 
 // verifyGitHubSignature validates the X-Hub-Signature-256 header
 // This ensures the request actually came from GitHub
-func verifyGitHubSignature(payload []byte, signature string) bool {
-	secret := getEnv("GITHUB_WEBHOOK_SECRET", "")
+func verifyGitHubSignature(payload []byte, signature string, secretOverride string) bool {
+	secret := secretOverride
 	if secret == "" {
-		log.Println("⚠️ Warning: GITHUB_WEBHOOK_SECRET not set, skipping signature verification")
+		secret = getEnv("GITHUB_WEBHOOK_SECRET", "")
+	}
+	if secret == "" {
+		log.Println("⚠️ Warning: webhook secret not set, skipping signature verification")
 		return true // Allow in development, but log warning
 	}
 
@@ -1259,6 +1645,242 @@ func verifyGitHubSignature(payload []byte, signature string) bool {
 
 	// Constant-time comparison to prevent timing attacks
 	return hmac.Equal([]byte(expectedMAC), []byte(actualMAC))
+}
+
+// resolveWebhookSecret attempts to resolve a repo-specific webhook secret
+func resolveWebhookSecret(eventType string, payload []byte) string {
+	var repoURL string
+
+	switch eventType {
+	case "push":
+		var push GitHubPushPayload
+		if err := json.Unmarshal(payload, &push); err == nil {
+			repoURL = push.Repository.CloneURL
+		}
+	case "pull_request":
+		var pr GitHubPullRequestPayload
+		if err := json.Unmarshal(payload, &pr); err == nil {
+			repoURL = pr.Repository.CloneURL
+		}
+	}
+
+	if repoURL == "" {
+		return ""
+	}
+
+	repoURL = normalizeRepoURL(repoURL)
+	var secret sql.NullString
+	err := db.QueryRow(`
+		SELECT w.secret
+		FROM webhooks w
+		JOIN repositories r ON w.repo_id = r.id
+		WHERE r.url = $1 AND w.active = true
+		ORDER BY w.id DESC
+		LIMIT 1
+	`, repoURL).Scan(&secret)
+	if err != nil || !secret.Valid {
+		return ""
+	}
+
+	return secret.String
+}
+
+func signGitHubPayload(payload []byte, secret string) string {
+	if secret == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func normalizeRepoURL(repoURL string) string {
+	normalized := strings.ToLower(strings.TrimSpace(repoURL))
+	normalized = strings.TrimSuffix(normalized, ".git")
+	normalized = strings.TrimSuffix(normalized, "/")
+	return normalized
+}
+
+func parseRepoName(repoURL string) string {
+	trimmed := normalizeRepoURL(repoURL)
+	parts := strings.Split(trimmed, "/")
+	if len(parts) == 0 {
+		return "repository"
+	}
+	return parts[len(parts)-1]
+}
+
+func getOrCreateRepository(repoURL string) (int, error) {
+	normalized := normalizeRepoURL(repoURL)
+	var id int
+	err := db.QueryRow("SELECT id FROM repositories WHERE url = $1", normalized).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return 0, err
+	}
+
+	name := parseRepoName(normalized)
+	err = db.QueryRow(`
+		INSERT INTO repositories (url, owner_id, name)
+		VALUES ($1, $2, $3)
+		RETURNING id
+	`, normalized, 1, name).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func lookupRepoURL(repoID int) string {
+	var url string
+	if err := db.QueryRow("SELECT url FROM repositories WHERE id = $1", repoID).Scan(&url); err != nil {
+		return ""
+	}
+	return url
+}
+
+func fetchGraphEngineJSON(baseURL, endpoint string) (map[string]interface{}, error) {
+	url := strings.TrimRight(baseURL, "/") + endpoint
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("graph engine error: %s", string(body))
+	}
+	var payload map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func fetchGraphEngineGraph(baseURL, repoID string, maxNodes int) (*GraphEngineGraphResponse, []string, error) {
+	warnings := []string{}
+	limit := maxNodes
+	if limit <= 0 {
+		limit = 5000
+	}
+	url := fmt.Sprintf("%s/api/graph/%s?limit=%d&offset=0", strings.TrimRight(baseURL, "/"), repoID, limit)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, warnings, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, warnings, fmt.Errorf("graph engine error: %s", string(body))
+	}
+	var graph GraphEngineGraphResponse
+	if err := json.NewDecoder(resp.Body).Decode(&graph); err != nil {
+		return nil, warnings, err
+	}
+	if graph.HasMore {
+		warnings = append(warnings, "graph_truncated")
+	}
+	return &graph, warnings, nil
+}
+
+func containsFormat(formats []string, target string) bool {
+	for _, format := range formats {
+		if strings.EqualFold(format, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeDiagramID(raw string) string {
+	if raw == "" {
+		return "node"
+	}
+	cleaned := regexp.MustCompile(`[^a-zA-Z0-9_]`).ReplaceAllString(raw, "_")
+	if cleaned == "" {
+		cleaned = "node"
+	}
+	if cleaned[0] >= '0' && cleaned[0] <= '9' {
+		cleaned = "n_" + cleaned
+	}
+	return cleaned
+}
+
+func buildMermaid(graph *GraphEngineGraphResponse) string {
+	if graph == nil {
+		return "graph TD"
+	}
+	lines := []string{"graph TD"}
+	idMap := map[string]string{}
+	used := map[string]int{}
+	for _, node := range graph.Nodes {
+		base := sanitizeDiagramID(node.ID)
+		if count, ok := used[base]; ok {
+			count++
+			used[base] = count
+			base = fmt.Sprintf("%s_%d", base, count)
+		} else {
+			used[base] = 1
+		}
+		idMap[node.ID] = base
+		label := strings.ReplaceAll(node.Label, "\"", "'")
+		lines = append(lines, fmt.Sprintf("%s[\"%s\"]", base, label))
+	}
+	for _, edge := range graph.Edges {
+		source := idMap[edge.Source]
+		target := idMap[edge.Target]
+		if source == "" || target == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s --> %s", source, target))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func buildPlantUML(graph *GraphEngineGraphResponse) string {
+	if graph == nil {
+		return "@startuml\n@enduml"
+	}
+	lines := []string{"@startuml"}
+	idMap := map[string]string{}
+	used := map[string]int{}
+	for _, node := range graph.Nodes {
+		base := sanitizeDiagramID(node.ID)
+		if count, ok := used[base]; ok {
+			count++
+			used[base] = count
+			base = fmt.Sprintf("%s_%d", base, count)
+		} else {
+			used[base] = 1
+		}
+		idMap[node.ID] = base
+		label := strings.ReplaceAll(node.Label, "\"", "'")
+		lines = append(lines, fmt.Sprintf("object %s as \"%s\"", base, label))
+	}
+	for _, edge := range graph.Edges {
+		source := idMap[edge.Source]
+		target := idMap[edge.Target]
+		if source == "" || target == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s --> %s", source, target))
+	}
+	lines = append(lines, "@enduml")
+	return strings.Join(lines, "\n")
+}
+
+func buildMarkdownExport(graph *GraphEngineGraphResponse) string {
+	mermaid := buildMermaid(graph)
+	return strings.Join([]string{
+		"# Architecture Export",
+		"",
+		"## Mermaid Graph",
+		"```mermaid",
+		mermaid,
+		"```",
+	}, "\n")
 }
 
 // handlePushEvent processes GitHub push events
