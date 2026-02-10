@@ -919,7 +919,21 @@ func updateJob(c *gin.Context) {
 
 	if update.Type != "error" && req.ResultSummary != nil {
 		if _, ok := req.ResultSummary["graph_patch"]; ok {
-			update.Type = "graph_patch"
+			update.Type = "graph_updated"
+			if changedNodes, ok := req.ResultSummary["changed_nodes"].([]interface{}); ok {
+				for _, node := range changedNodes {
+					if id, ok := node.(string); ok {
+						update.ChangedNodes = append(update.ChangedNodes, id)
+					}
+				}
+			}
+			if changedEdges, ok := req.ResultSummary["changed_edges"].([]interface{}); ok {
+				for _, edge := range changedEdges {
+					if id, ok := edge.(string); ok {
+						update.ChangedEdges = append(update.ChangedEdges, id)
+					}
+				}
+			}
 		}
 	}
 	
@@ -1436,6 +1450,7 @@ func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []st
 		}
 		filesJSON, _ := json.Marshal(changedFiles)
 		options["changed_files"] = string(filesJSON)
+		options["incremental"] = "true"
 		options["analysis_mode"] = "incremental"
 	}
 
@@ -1447,6 +1462,7 @@ func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []st
 		}
 		removedJSON, _ := json.Marshal(removedFiles)
 		options["removed_files"] = string(removedJSON)
+		options["incremental"] = "true"
 		options["analysis_mode"] = "incremental"
 	}
 

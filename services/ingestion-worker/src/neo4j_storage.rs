@@ -96,7 +96,7 @@ async fn delete_file_nodes(txn: &mut neo4rs::Txn, repo_id: &str, files: &[String
 
     let remove_files = query(
         "UNWIND $paths AS path
-         MATCH (f:File {id: path, repo_id: $repo_id})
+         MATCH (f:File {path: path, repo_id: $repo_id})
          DETACH DELETE f"
     )
     .param("paths", files.to_vec())
@@ -310,7 +310,8 @@ pub async fn store_graph_incremental(
 
 async fn create_job_node(txn: &mut neo4rs::Txn, job_id: &str, repo_id: &str) -> Result<()> {
     let q = query(
-        "CREATE (j:Job {id: $id, repo_id: $repo_id, status: 'COMPLETED', timestamp: datetime()})"
+        "MERGE (j:Job {id: $id, repo_id: $repo_id})
+         SET j.status = 'COMPLETED', j.timestamp = datetime()"
     )
     .param("id", job_id)
     .param("repo_id", repo_id);

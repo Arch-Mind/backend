@@ -440,7 +440,13 @@ async fn analyze_repository(
     info!("📦 Repository cloned to: {:?}", temp_repo.path);
 
     let (changed_files, removed_files) = extract_webhook_changes(&job.options);
-    let incremental = !changed_files.is_empty() || !removed_files.is_empty();
+    let incremental_flag = job
+        .options
+        .as_ref()
+        .and_then(|opts| opts.get("incremental"))
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let incremental = incremental_flag || !changed_files.is_empty() || !removed_files.is_empty();
 
     // Update progress: 25%
     if let Err(e) = api_client.update_job(&job.job_id, JobUpdatePayload {
@@ -598,7 +604,13 @@ async fn analyze_repository(
 
     if incremental {
         let patch = build_graph_patch(&parsed_files, &dep_graph, &changed_files, &removed_files);
-        summary["graph_patch"] = serde_json::to_value(patch)?;
+        summary["graph_patch"] = serde_json::to_value(&patch)?;
+        summary["changed_nodes"] = serde_json::to_value(
+            patch.nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>()
+        )?;
+        summary["changed_edges"] = serde_json::to_value(
+            patch.edges.iter().map(|edge| edge.id.clone()).collect::<Vec<_>>()
+        )?;
     }
     
     Ok(summary)
