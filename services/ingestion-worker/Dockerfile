@@ -24,7 +24,7 @@ RUN cargo build --release
 # Final stage
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates libgcc
+RUN apk --no-cache add ca-certificates libgcc openssl
 
 WORKDIR /root/
 
