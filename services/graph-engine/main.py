@@ -199,6 +199,40 @@ def build_fallback_logical_boundaries(session, repo_id: str) -> List[Dict]:
     return boundaries
 
 
+def normalize_neo4j_value(value):
+    """
+    Convert Neo4j-specific runtime types (DateTime, Date, Time, Duration, etc.)
+    into JSON-serializable Python primitives.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, dict):
+        return {k: normalize_neo4j_value(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [normalize_neo4j_value(v) for v in value]
+
+    # Neo4j temporal values expose iso_format(); prefer that over str().
+    if hasattr(value, "iso_format"):
+        try:
+            return value.iso_format()
+        except Exception:
+            pass
+
+    # Some Neo4j wrappers expose native Python values.
+    if hasattr(value, "to_native"):
+        try:
+            return normalize_neo4j_value(value.to_native())
+        except Exception:
+            pass
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    return str(value)
+
+
 def get_postgres_connection():
     return psycopg2.connect(postgres_url)
 
@@ -490,7 +524,7 @@ async def get_dependency_graph(repo_id: str, limit: int = 100, offset: int = 0):
                         id=node_id,
                         label=node_name,
                         type=record["type"] or "Unknown",
-                        properties=record["props"] or {}
+                        properties=normalize_neo4j_value(record["props"] or {})
                     )
                     nodes.append(node)
                 except Exception as e:
@@ -647,10 +681,10 @@ async def get_file_contributions(repo_id: str):
                 contributions.append({
                     "file_path": record["file_path"],
                     "commit_count": record["commit_count"] or 0,
-                    "last_commit_date": record["last_commit_date"],
+                    "last_commit_date": normalize_neo4j_value(record["last_commit_date"]),
                     "primary_author": record["primary_author"] or "",
                     "lines_changed_total": record["lines_changed_total"] or 0,
-                    "contributors": record["contributors"] or [],
+                    "contributors": normalize_neo4j_value(record["contributors"] or []),
                     "contributor_count": len(record["contributors"] or []),
                     "language": record["language"]
                 })
