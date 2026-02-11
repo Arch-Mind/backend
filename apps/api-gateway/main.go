@@ -542,12 +542,28 @@ func main() {
 
 // initRedis initializes the Redis client
 func initRedis() {
-	redisURL := getEnv("REDIS_URL", "localhost:6379")
-	redisClient = redis.NewClient(&redis.Options{
-		Addr:     redisURL,
-		Password: getEnv("REDIS_PASSWORD", ""),
-		DB:       0,
-	})
+	redisURL := strings.TrimSpace(getEnv("REDIS_URL", "localhost:6379"))
+	redisPassword := getEnv("REDIS_PASSWORD", "")
+
+	var options *redis.Options
+	if strings.HasPrefix(redisURL, "redis://") || strings.HasPrefix(redisURL, "rediss://") {
+		parsed, err := redis.ParseURL(redisURL)
+		if err != nil {
+			log.Fatalf("Failed to parse REDIS_URL: %v", err)
+		}
+		if parsed.Password == "" && redisPassword != "" {
+			parsed.Password = redisPassword
+		}
+		options = parsed
+	} else {
+		options = &redis.Options{
+			Addr:     redisURL,
+			Password: redisPassword,
+			DB:       0,
+		}
+	}
+
+	redisClient = redis.NewClient(options)
 
 	// Test connection
 	if err := redisClient.Ping(ctx).Err(); err != nil {
