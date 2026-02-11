@@ -14,4 +14,16 @@ echo "API_GATEWAY_URL set: ${API_GATEWAY_URL:+yes}${API_GATEWAY_URL:-no}"
 echo "REDIS_URL set: ${REDIS_URL:+yes}${REDIS_URL:-no}"
 echo "NEO4J_URI set: ${NEO4J_URI:+yes}${NEO4J_URI:-no}"
 
-exec /root/ingestion-worker
+echo "Binary info:"
+file /root/ingestion-worker || true
+ldd /root/ingestion-worker || true
+
+export RUST_BACKTRACE=1
+
+set +e
+/root/ingestion-worker
+code=$?
+set -e
+
+echo "ingestion-worker exited with code ${code}"
+exit $code
