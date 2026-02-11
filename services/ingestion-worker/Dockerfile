@@ -39,5 +39,9 @@ WORKDIR /root/
 # Copy the binary from builder
 COPY --from=builder /app/target/release/ingestion-worker .
 
+# Entry point wrapper for startup diagnostics
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
 # Run the binary
-CMD ["./ingestion-worker"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
