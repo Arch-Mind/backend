@@ -1,10 +1,14 @@
 # Ingestion Worker Dockerfile
-FROM rust:1.84-alpine AS builder
+FROM rust:1.84-slim AS builder
 
 WORKDIR /app
 
 # Install build dependencies
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    cmake \
+  && rm -rf /var/lib/apt/lists/*
 
 # Copy Cargo files
 COPY Cargo.toml Cargo.lock ./
@@ -22,9 +26,13 @@ COPY src ./src
 RUN cargo build --release
 
 # Final stage
-FROM alpine:latest
+FROM debian:bookworm-slim
 
-RUN apk --no-cache add ca-certificates libgcc openssl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    libgcc-s1 \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/
 
