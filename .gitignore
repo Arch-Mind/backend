@@ -48,7 +48,7 @@ go.work
 go.work.sum
 
 # Rust
-Cargo.lock
+!services/ingestion-worker/Cargo.lock
 debug/
 target/
 
