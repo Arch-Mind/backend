@@ -739,17 +739,45 @@ fn parse_repository_subset(repo_path: &PathBuf, files: &[String]) -> Result<Vec<
             continue;
         }
 
-        let content = fs::read_to_string(&abs_path)
-            .context(format!("Failed to read file: {:?}", abs_path))?;
         let relative_path_buf = PathBuf::from(&normalized);
         let ext = abs_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
 
         let parsed = match ext.as_str() {
-            "js" | "jsx" | "mjs" => Some(js_parser.parse_file(&relative_path_buf, &content)?),
-            "ts" | "tsx" => Some(ts_parser.parse_file(&relative_path_buf, &content)?),
-            "rs" => Some(rust_parser.parse_file(&relative_path_buf, &content)?),
-            "go" => Some(go_parser.parse_file(&relative_path_buf, &content)?),
-            "py" => Some(py_parser.parse_file(&relative_path_buf, &content)?),
+            "js" | "jsx" | "mjs" => match fs::read_to_string(&abs_path) {
+                Ok(content) => js_parser.parse_file(&relative_path_buf, &content).ok(),
+                Err(e) => {
+                    warn!("⚠️  Failed to read file {:?}: {}", abs_path, e);
+                    None
+                }
+            },
+            "ts" | "tsx" => match fs::read_to_string(&abs_path) {
+                Ok(content) => ts_parser.parse_file(&relative_path_buf, &content).ok(),
+                Err(e) => {
+                    warn!("⚠️  Failed to read file {:?}: {}", abs_path, e);
+                    None
+                }
+            },
+            "rs" => match fs::read_to_string(&abs_path) {
+                Ok(content) => rust_parser.parse_file(&relative_path_buf, &content).ok(),
+                Err(e) => {
+                    warn!("⚠️  Failed to read file {:?}: {}", abs_path, e);
+                    None
+                }
+            },
+            "go" => match fs::read_to_string(&abs_path) {
+                Ok(content) => go_parser.parse_file(&relative_path_buf, &content).ok(),
+                Err(e) => {
+                    warn!("⚠️  Failed to read file {:?}: {}", abs_path, e);
+                    None
+                }
+            },
+            "py" => match fs::read_to_string(&abs_path) {
+                Ok(content) => py_parser.parse_file(&relative_path_buf, &content).ok(),
+                Err(e) => {
+                    warn!("⚠️  Failed to read file {:?}: {}", abs_path, e);
+                    None
+                }
+            },
             _ => None,
         };
 

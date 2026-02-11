@@ -156,6 +156,7 @@ cargo run --release
 | `NEO4J_URI` | Neo4j Bolt URI | `bolt://localhost:7687` |
 | `NEO4J_USER` | Neo4j username | `neo4j` |
 | `NEO4J_PASSWORD` | Neo4j password | `password` |
+| `API_GATEWAY_URL` | API Gateway base URL | `http://localhost:8080` |
 | `RUST_LOG` | Log level | `info` |
 
 ## Logging

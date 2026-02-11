@@ -168,6 +168,7 @@ railway run psql $DATABASE_URL < infra/postgres/init/001_schema.sql
 - `NEO4J_USER` - Neo4j username
 - `NEO4J_PASSWORD` - Neo4j password
 - `REDIS_URL` - Redis connection string
+- `API_GATEWAY_URL` - Public API Gateway URL (e.g., https://your-api-gateway.up.railway.app)
 
 ## Testing Locally with Docker Compose
 
