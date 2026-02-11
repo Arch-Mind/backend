@@ -162,6 +162,43 @@ async def check_repo_exists(session, repo_id: str) -> bool:
         return False
 
 
+def build_fallback_logical_boundaries(session, repo_id: str) -> List[Dict]:
+    """
+    Build logical boundaries from top-level file path segments when Boundary nodes are absent.
+    """
+    query = """
+    MATCH (f:File)
+    WHERE f.repo_id = $repo_id OR f.job_id = $repo_id
+    WITH
+        CASE
+            WHEN f.path IS NULL OR trim(f.path) = '' THEN 'root'
+            WHEN f.path CONTAINS '/' THEN split(f.path, '/')[0]
+            WHEN f.path CONTAINS '\\\\' THEN split(f.path, '\\\\')[0]
+            ELSE 'root'
+        END AS segment,
+        collect(COALESCE(f.path, f.id)) AS files
+    RETURN segment, files
+    ORDER BY size(files) DESC
+    """
+    result = session.run(query, repo_id=repo_id)
+    boundaries: List[Dict] = []
+    for record in result:
+        files = [f for f in (record["files"] or []) if f]
+        if not files:
+            continue
+        segment = record["segment"] or "root"
+        boundaries.append({
+            "id": f"fallback:{segment}",
+            "name": segment,
+            "type": "logical",
+            "path": None if segment == "root" else segment,
+            "layer": "",
+            "file_count": len(files),
+            "files": files,
+        })
+    return boundaries
+
+
 def get_postgres_connection():
     return psycopg2.connect(postgres_url)
 
@@ -593,8 +630,8 @@ async def get_file_contributions(repo_id: str):
         with neo4j_driver.session() as session:
             query = """
             MATCH (f:File)
-            WHERE f.repo_id = $repo_id
-            RETURN f.id as file_path,
+            WHERE f.repo_id = $repo_id OR f.job_id = $repo_id
+            RETURN COALESCE(f.path, f.id) as file_path,
                    f.commit_count as commit_count,
                    f.last_commit_date as last_commit_date,
                    f.primary_author as primary_author,
@@ -643,7 +680,7 @@ async def get_module_boundaries(repo_id: str, boundary_type: Optional[str] = Non
     try:
         with neo4j_driver.session() as session:
             # Build query based on filters
-            where_clause = "b.repo_id = $repo_id"
+            where_clause = "(b.repo_id = $repo_id OR b.job_id = $repo_id)"
             params = {"repo_id": repo_id}
             
             if boundary_type:
@@ -654,13 +691,14 @@ async def get_module_boundaries(repo_id: str, boundary_type: Optional[str] = Non
             MATCH (b:Boundary)
             WHERE {where_clause}
             OPTIONAL MATCH (f:File)-[:BELONGS_TO]->(b)
+            WHERE f.repo_id = $repo_id OR f.job_id = $repo_id
             RETURN b.id as id,
                    b.name as name,
                    b.type as type,
                    b.path as path,
                    b.layer as layer,
                    b.file_count as file_count,
-                   collect(f.id) as files
+                   collect(COALESCE(f.path, f.id)) as files
             ORDER BY b.type, b.name
             """
             result = session.run(query, **params)
@@ -676,6 +714,10 @@ async def get_module_boundaries(repo_id: str, boundary_type: Optional[str] = Non
                     "file_count": record["file_count"],
                     "files": [f for f in record["files"] if f]  # Filter out nulls
                 })
+
+            # Fallback for older/incomplete datasets with no Boundary nodes.
+            if not boundaries and (boundary_type is None or boundary_type == "logical"):
+                boundaries = build_fallback_logical_boundaries(session, repo_id)
             
             logger.info(f"🗺️  Retrieved {len(boundaries)} boundaries in repo {repo_id}")
             return {
