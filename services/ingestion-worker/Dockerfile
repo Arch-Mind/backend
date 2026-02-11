@@ -10,20 +10,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
   && rm -rf /var/lib/apt/lists/*
 
-# Copy Cargo files
+# Copy source code
 COPY Cargo.toml Cargo.lock ./
-
-# Create dummy main to cache dependencies
-RUN mkdir src && \
-    echo "fn main() {}" > src/main.rs && \
-    cargo build --release && \
-    rm -rf src
-
-# Copy actual source code
 COPY src ./src
 
 # Build the application
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # Final stage
 FROM debian:bookworm-slim
