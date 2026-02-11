@@ -6,6 +6,39 @@
 
 ArchMind is a backend-only platform that parses JavaScript/TypeScript codebases using Tree-sitter, extracts function definitions and calls, constructs comprehensive dependency graphs, and stores them in Neo4j for querying and analysis. Built as a modular event-driven architecture with async workers.
 
+## 🚀 Quick Start with Docker
+
+The fastest way to run ArchMind is using Docker Compose:
+
+```bash
+# 1. Navigate to backend directory
+cd backend
+
+# 2. Set up environment variables (copy and edit)
+cp services/graph-engine/.env.example services/graph-engine/.env
+# Edit .env to add your GEMINI_API_KEY
+
+# 3. Start all services
+docker-compose up --build
+
+# 4. Run health checks
+bash healthcheck.sh
+
+# 5. Run database migrations
+docker exec archmind-postgres psql -U postgres -d arch-mind < infra/postgres/init/001_schema.sql
+docker exec archmind-postgres psql -U postgres -d arch-mind < infra/postgres/init/002_file_contributions.sql
+docker exec archmind-postgres psql -U postgres -d arch-mind < infra/postgres/init/003_architecture_insights.sql
+```
+
+**Services available at:**
+- API Gateway: http://localhost:8080
+- Graph Engine: http://localhost:8000
+- Neo4j Browser: http://localhost:7474
+- PostgreSQL: localhost:5432
+- Redis: localhost:6379
+
+For production deployment to Railway, see [RAILWAY_DEPLOYMENT.md](RAILWAY_DEPLOYMENT.md)
+
 ## 🏗️ Architecture
 
 ### High-Level Overview

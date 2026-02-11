@@ -145,36 +145,23 @@ def call_gemini(prompt: str, settings: LLMSettings) -> str:
     if not settings.gemini_api_key:
         raise ValueError("GEMINI_API_KEY is required for Gemini provider")
 
-    model = settings.model or "gemini-1.5-flash"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.gemini_api_key}"
-    
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 900,
-        }
-    }
-
-    with httpx.Client(timeout=60) as client:
-        resp = client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+    try:
+        from google import genai
         
-        candidates = data.get("candidates", [])
-        if candidates:
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-            if parts:
-                return parts[0].get("text", "").strip()
+        # Set API key environment variable for the SDK
+        os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
         
-        return ""
+        client = genai.Client()
+        model = settings.model or "gemini-1.5-flash"
+        
+        response = client.models.generate_content(
+            model=model, 
+            contents=prompt
+        )
+        
+        return response.text.strip()
+    except Exception as e:
+        raise ValueError(f"Gemini API error: {str(e)}")
 
 
 def build_pattern_prompt(summary: Dict[str, Any]) -> str:

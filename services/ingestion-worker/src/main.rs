@@ -1169,30 +1169,53 @@ pub(crate) fn walk_directory(
                 let relative_path = path.strip_prefix(root_dir).unwrap_or(&path);
                 // Ensure forward slashes for consistency across OS
                 let path_str = relative_path.to_string_lossy().replace("\\", "/");
-                
-                // We fake the path in the parser so that the ParsedFile contains relative path
-                // But we read content from the absolute path
-                let content = fs::read_to_string(&path)
-                    .context(format!("Failed to read file: {:?}", path))?;
-                
-                // Create a PathBuf from the relative path string for the parser
                 let relative_path_buf = PathBuf::from(&path_str);
                 
                 let parsed = match ext.as_str() {
                     "js" | "jsx" | "mjs" => {
-                        js_parser.parse_file(&relative_path_buf, &content).ok()
+                        match fs::read_to_string(&path) {
+                            Ok(content) => js_parser.parse_file(&relative_path_buf, &content).ok(),
+                            Err(e) => {
+                                warn!("⚠️  Failed to read file {:?}: {}", path, e);
+                                None
+                            }
+                        }
                     }
                     "ts" | "tsx" => {
-                        ts_parser.parse_file(&relative_path_buf, &content).ok()
+                        match fs::read_to_string(&path) {
+                            Ok(content) => ts_parser.parse_file(&relative_path_buf, &content).ok(),
+                            Err(e) => {
+                                warn!("⚠️  Failed to read file {:?}: {}", path, e);
+                                None
+                            }
+                        }
                     }
                     "rs" => {
-                        rust_parser.parse_file(&relative_path_buf, &content).ok()
+                        match fs::read_to_string(&path) {
+                            Ok(content) => rust_parser.parse_file(&relative_path_buf, &content).ok(),
+                            Err(e) => {
+                                warn!("⚠️  Failed to read file {:?}: {}", path, e);
+                                None
+                            }
+                        }
                     }
                     "go" => {
-                        go_parser.parse_file(&relative_path_buf, &content).ok()
+                        match fs::read_to_string(&path) {
+                            Ok(content) => go_parser.parse_file(&relative_path_buf, &content).ok(),
+                            Err(e) => {
+                                warn!("⚠️  Failed to read file {:?}: {}", path, e);
+                                None
+                            }
+                        }
                     }
                     "py" => {
-                        py_parser.parse_file(&relative_path_buf, &content).ok()
+                        match fs::read_to_string(&path) {
+                            Ok(content) => py_parser.parse_file(&relative_path_buf, &content).ok(),
+                            Err(e) => {
+                                warn!("⚠️  Failed to read file {:?}: {}", path, e);
+                                None
+                            }
+                        }
                     }
                     _ => None,
                 };
