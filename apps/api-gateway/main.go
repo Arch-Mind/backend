@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -596,6 +597,33 @@ func initPostgres() {
 	if db == nil {
 		log.Fatal("Failed to connect to PostgreSQL after all retries")
 	}
+
+	if err := ensureCommitHistorySchema(); err != nil {
+		log.Printf("⚠️  Failed to ensure commit_history schema: %v", err)
+	}
+}
+
+// ensureCommitHistorySchema creates commit history storage if migrations were not applied.
+func ensureCommitHistorySchema() error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS commit_history (
+			id SERIAL PRIMARY KEY,
+			repo_uuid VARCHAR(255) NOT NULL,
+			repo_url TEXT NOT NULL,
+			commit_sha VARCHAR(64) NOT NULL,
+			author_name VARCHAR(255),
+			author_email VARCHAR(255),
+			authored_at TIMESTAMP,
+			message TEXT,
+			changed_files JSONB,
+			files_changed_count INTEGER DEFAULT 0,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(repo_uuid, commit_sha)
+		);
+		CREATE INDEX IF NOT EXISTS idx_commit_history_repo_uuid ON commit_history(repo_uuid);
+		CREATE INDEX IF NOT EXISTS idx_commit_history_authored_at ON commit_history(authored_at DESC);
+	`)
+	return err
 }
 
 // connectPostgresWithRetry attempts to connect to PostgreSQL with exponential backoff
@@ -1213,6 +1241,41 @@ func listCommitHistory(c *gin.Context) {
 		}
 	}
 
+	commits, err := queryCommitHistoryTable(repoID, limit)
+	if err != nil {
+		log.Printf("Database error reading commit_history table (repo=%s): %v", repoID, err)
+
+		fallbackCommits, fallbackErr := queryCommitHistoryFromJobSummaries(repoID, limit)
+		if fallbackErr != nil {
+			log.Printf("Fallback error reading commit history from job summaries (repo=%s): %v", repoID, fallbackErr)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to retrieve commit history",
+			})
+			return
+		}
+
+		log.Printf("ℹ️ Using commit history fallback from analysis_jobs for repo %s (%d commits)", repoID, len(fallbackCommits))
+		c.JSON(http.StatusOK, CommitHistoryResponse{
+			RepoID:  repoID,
+			Commits: fallbackCommits,
+		})
+		return
+	}
+
+	// If table is available but empty, try reading the latest worker payloads as a backup.
+	if len(commits) == 0 {
+		if fallbackCommits, fallbackErr := queryCommitHistoryFromJobSummaries(repoID, limit); fallbackErr == nil && len(fallbackCommits) > 0 {
+			commits = fallbackCommits
+		}
+	}
+
+	c.JSON(http.StatusOK, CommitHistoryResponse{
+		RepoID:  repoID,
+		Commits: commits,
+	})
+}
+
+func queryCommitHistoryTable(repoID string, limit int) ([]CommitHistoryItem, error) {
 	rows, err := db.Query(`
 		SELECT commit_sha, author_name, author_email, authored_at, message, changed_files, files_changed_count
 		FROM commit_history
@@ -1221,15 +1284,11 @@ func listCommitHistory(c *gin.Context) {
 		LIMIT $2
 	`, repoID, limit)
 	if err != nil {
-		log.Printf("Database error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to retrieve commit history",
-		})
-		return
+		return nil, err
 	}
 	defer rows.Close()
 
-	commits := []CommitHistoryItem{}
+	commits := make([]CommitHistoryItem, 0, limit)
 	for rows.Next() {
 		var sha string
 		var authorName sql.NullString
@@ -1261,13 +1320,92 @@ func listCommitHistory(c *gin.Context) {
 		if authoredAt.Valid {
 			commit.AuthoredAt = authoredAt.Time.UTC().Format(time.RFC3339)
 		}
+		if commit.FilesChangedCount == 0 {
+			commit.FilesChangedCount = len(commit.ChangedFiles)
+		}
 		commits = append(commits, commit)
 	}
 
-	c.JSON(http.StatusOK, CommitHistoryResponse{
-		RepoID:  repoID,
-		Commits: commits,
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return commits, nil
+}
+
+func queryCommitHistoryFromJobSummaries(repoID string, limit int) ([]CommitHistoryItem, error) {
+	rows, err := db.Query(`
+		SELECT repo_url, result_summary
+		FROM analysis_jobs
+		WHERE result_summary IS NOT NULL
+		ORDER BY updated_at DESC NULLS LAST, created_at DESC
+		LIMIT 250
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seenSHAs := make(map[string]bool, limit)
+	commits := make([]CommitHistoryItem, 0, limit)
+
+	for rows.Next() {
+		var repoURL string
+		var summaryJSON []byte
+		if err := rows.Scan(&repoURL, &summaryJSON); err != nil {
+			log.Printf("Scan error reading job summary fallback: %v", err)
+			continue
+		}
+
+		if generateRepoID(repoURL) != repoID {
+			continue
+		}
+
+		var summary map[string]interface{}
+		if err := json.Unmarshal(summaryJSON, &summary); err != nil {
+			log.Printf("JSON decode error in job summary fallback: %v", err)
+			continue
+		}
+
+		parsedCommits, err := extractCommitHistory(summary)
+		if err != nil {
+			log.Printf("Commit history parse error in fallback: %v", err)
+			continue
+		}
+
+		for _, commit := range parsedCommits {
+			if commit.SHA == "" || seenSHAs[commit.SHA] {
+				continue
+			}
+			if commit.FilesChangedCount == 0 {
+				commit.FilesChangedCount = len(commit.ChangedFiles)
+			}
+			seenSHAs[commit.SHA] = true
+			commits = append(commits, commit)
+			if len(commits) >= limit {
+				break
+			}
+		}
+
+		if len(commits) >= limit {
+			break
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.SliceStable(commits, func(i, j int) bool {
+		left := parseCommitTime(commits[i].AuthoredAt)
+		right := parseCommitTime(commits[j].AuthoredAt)
+		if left.Valid && right.Valid {
+			return left.Time.After(right.Time)
+		}
+		return left.Valid && !right.Valid
 	})
+
+	return commits, nil
 }
 
 // listWebhooks returns configured webhooks
