@@ -8,7 +8,7 @@
 use crate::parsers::ParsedFile;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use tracing::{info, debug};
 

@@ -194,8 +194,10 @@ impl GitAnalyzer {
         ).context("Failed to process diff files")?;
 
         // Update file stats for changed files
-        for path_str in files_changed {
-            let stats = file_stats.entry(path_str).or_insert_with(FileStats::new);
+        for path_str in &files_changed {
+            let stats = file_stats
+                .entry(path_str.clone())
+                .or_insert_with(FileStats::new);
             stats.update_from_commit(
                 &author_email,
                 &author_name,
