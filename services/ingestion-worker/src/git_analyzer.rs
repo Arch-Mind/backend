@@ -8,6 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use chrono::{DateTime, Utc, TimeZone};
 use tracing::{info, warn, debug};
+use serde::Serialize;
+
+const DEFAULT_MAX_COMMITS: usize = 1000;
 
 /// File contribution metrics extracted from git history
 #[derive(Debug, Clone)]
@@ -22,8 +25,20 @@ pub struct FileContribution {
     pub lines_changed_total: usize,
 }
 
+/// Commit history record extracted from git
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitRecord {
+    pub sha: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub message: String,
+    pub authored_at: DateTime<Utc>,
+    pub changed_files: Vec<String>,
+    pub files_changed_count: usize,
+}
+
 /// Individual contributor information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ContributorInfo {
     pub email: String,
     pub name: String,
@@ -38,6 +53,7 @@ pub struct RepoContributions {
     pub files: HashMap<String, FileContribution>,
     pub total_commits: usize,
     pub total_contributors: usize,
+    pub commits: Vec<CommitRecord>,
 }
 
 /// Analyzes git history for a repository
@@ -57,36 +73,49 @@ impl GitAnalyzer {
 
     /// Extract contribution metrics for all files in the repository
     pub fn analyze_contributions(&self) -> Result<RepoContributions> {
+        self.analyze_contributions_with_limit(DEFAULT_MAX_COMMITS)
+    }
+
+    /// Extract contribution metrics for all files, but store only the latest N commit records.
+    pub fn analyze_contributions_with_limit(&self, max_commits: usize) -> Result<RepoContributions> {
         info!("🔍 Analyzing git commit history...");
-        
+
         let mut file_stats: HashMap<String, FileStats> = HashMap::new();
         let mut all_contributors: HashSet<String> = HashSet::new();
         let mut total_commits = 0;
+        let mut commits: Vec<CommitRecord> = Vec::new();
 
         // Walk through all commits
         let mut revwalk = self.repo.revwalk()
             .context("Failed to create revwalk")?;
-        
+
         revwalk.push_head()
             .context("Failed to push HEAD")?;
-        
+
         for oid in revwalk {
             let oid = oid.context("Failed to get commit OID")?;
-            
-            if let Err(e) = self.process_commit(oid, &mut file_stats, &mut all_contributors) {
-                warn!("⚠️  Error processing commit {}: {}", oid, e);
-                continue;
+
+            match self.process_commit(oid, &mut file_stats, &mut all_contributors) {
+                Ok(record) => {
+                    if max_commits > 0 && commits.len() < max_commits {
+                        commits.push(record);
+                    }
+                }
+                Err(e) => {
+                    warn!("⚠️  Error processing commit {}: {}", oid, e);
+                    continue;
+                }
             }
-            
+
             total_commits += 1;
-            
+
             // Progress indicator for large repos
             if total_commits % 100 == 0 {
                 debug!("Processed {} commits", total_commits);
             }
         }
 
-        info!("✅ Analyzed {} commits from {} contributors", 
+        info!("✅ Analyzed {} commits from {} contributors",
               total_commits, all_contributors.len());
 
         // Convert internal stats to FileContribution
@@ -99,6 +128,7 @@ impl GitAnalyzer {
             files,
             total_commits,
             total_contributors: all_contributors.len(),
+            commits,
         })
     }
 
@@ -108,7 +138,7 @@ impl GitAnalyzer {
         oid: Oid,
         file_stats: &mut HashMap<String, FileStats>,
         all_contributors: &mut HashSet<String>,
-    ) -> Result<()> {
+    ) -> Result<CommitRecord> {
         let commit = self.repo.find_commit(oid)
             .context("Failed to find commit")?;
         
@@ -118,6 +148,7 @@ impl GitAnalyzer {
         let commit_time = Utc.timestamp_opt(commit.time().seconds(), 0)
             .single()
             .unwrap_or_else(Utc::now);
+        let message = commit.message().unwrap_or("").trim().to_string();
 
         all_contributors.insert(author_email.clone());
 
@@ -197,7 +228,15 @@ impl GitAnalyzer {
             }),
         ).context("Failed to process diff lines")?;
 
-        Ok(())
+        Ok(CommitRecord {
+            sha: oid.to_string(),
+            author_name,
+            author_email,
+            message,
+            authored_at: commit_time,
+            files_changed_count: files_changed.len(),
+            changed_files: files_changed,
+        })
     }
 
     /// Get the latest commit for a specific file

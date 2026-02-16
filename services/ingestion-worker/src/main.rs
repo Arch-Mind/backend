@@ -126,6 +126,7 @@ struct Config {
     neo4j_user: String,
     neo4j_password: String,
     api_gateway_url: String,
+    git_max_commits: usize,
 }
 
 impl Config {
@@ -138,6 +139,10 @@ impl Config {
             neo4j_user: env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string()),
             neo4j_password: env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "password".to_string()),
             api_gateway_url: env::var("API_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
+            git_max_commits: env::var("GIT_MAX_COMMITS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1000),
         })
     }
 }
@@ -281,7 +286,7 @@ async fn main() -> Result<()> {
     // Main worker loop
     info!("👂 Listening for jobs on analysis_queue...");
     while !shutdown.load(Ordering::SeqCst) {
-        match process_job(&mut redis_conn, &neo4j_graph, &api_client).await {
+        match process_job(&mut redis_conn, &neo4j_graph, &api_client, config.git_max_commits).await {
             Ok(processed) => {
                 if !processed {
                     // No job available, sleep briefly
@@ -333,6 +338,7 @@ async fn process_job(
     redis_conn: &mut redis::aio::Connection,
     neo4j_graph: &neo4rs::Graph,
     api_client: &ApiClient,
+    git_max_commits: usize,
 ) -> Result<bool> {
     // Use RPOP instead of BRPOP for compatibility with Redis 3.x (Windows)
     // which doesn't support float timeouts sent by the redis crate
@@ -361,7 +367,7 @@ async fn process_job(
         }
 
         // Process the job
-        match analyze_repository(&job, neo4j_graph, api_client).await {
+        match analyze_repository(&job, neo4j_graph, api_client, git_max_commits).await {
             Ok(summary) => {
                 info!("✅ Successfully processed job: {}", job.job_id);
                 // Update status to COMPLETED
@@ -432,6 +438,7 @@ async fn analyze_repository(
     job: &AnalysisJob, 
     neo4j_graph: &neo4rs::Graph,
     api_client: &ApiClient,
+    git_max_commits: usize,
 ) -> Result<serde_json::Value> {
     info!("🔍 Analyzing repository: {}", job.repo_url);
 
@@ -485,7 +492,7 @@ async fn analyze_repository(
     // Step 4: Analyze git commit history
     let git_contributions = match git_analyzer::GitAnalyzer::new(&temp_repo.path) {
         Ok(analyzer) => {
-            match analyzer.analyze_contributions() {
+            match analyzer.analyze_contributions_with_limit(git_max_commits) {
                 Ok(contributions) => {
                     info!("📊 Analyzed git history: {} files with {} total commits", 
                           contributions.files.len(), 
@@ -601,6 +608,14 @@ async fn analyze_repository(
         "complexity_score": 0.0, // Placeholder
         "languages": {} // Placeholder
     });
+
+    if let Some(contributions) = git_contributions.as_ref() {
+        summary["commit_history"] = serde_json::to_value(&contributions.commits)?;
+        summary["commit_history_total"] = serde_json::json!(contributions.total_commits);
+        summary["commit_history_count"] = serde_json::json!(contributions.commits.len());
+        summary["commit_history_truncated"] = serde_json::json!(contributions.commits.len() < contributions.total_commits);
+        summary["commit_history_limit"] = serde_json::json!(git_max_commits);
+    }
 
     if incremental {
         let patch = build_graph_patch(&parsed_files, &dep_graph, &changed_files, &removed_files);

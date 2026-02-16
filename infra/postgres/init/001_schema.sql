@@ -69,6 +69,26 @@ CREATE TABLE IF NOT EXISTS analysis_results (
 
 CREATE INDEX idx_analysis_results_job_id ON analysis_results(job_id);
 
+-- ==================== Commit History Table ====================
+-- Stores commit history per repository UUID (deterministic from repo URL)
+CREATE TABLE IF NOT EXISTS commit_history (
+    id SERIAL PRIMARY KEY,
+    repo_uuid VARCHAR(255) NOT NULL,
+    repo_url TEXT NOT NULL,
+    commit_sha VARCHAR(64) NOT NULL,
+    author_name VARCHAR(255),
+    author_email VARCHAR(255),
+    authored_at TIMESTAMP,
+    message TEXT,
+    changed_files JSONB,
+    files_changed_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(repo_uuid, commit_sha)
+);
+
+CREATE INDEX idx_commit_history_repo_uuid ON commit_history(repo_uuid);
+CREATE INDEX idx_commit_history_authored_at ON commit_history(authored_at DESC);
+
 -- ==================== API Keys Table (for future use) ====================
 CREATE TABLE IF NOT EXISTS api_keys (
     id SERIAL PRIMARY KEY,

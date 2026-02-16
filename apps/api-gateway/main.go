@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -138,7 +139,7 @@ type WebhookListResponse struct {
 
 // ExportRequest represents export request parameters
 type ExportRequest struct {
-	Formats          []string `json:"formats"`
+	Formats           []string `json:"formats"`
 	IncludeLLMSummary bool     `json:"include_llm_summary"`
 	IncludeHeatmap    bool     `json:"include_heatmap"`
 	MaxNodes          int      `json:"max_nodes"`
@@ -150,6 +151,22 @@ type ExportResponse struct {
 	RepoID   string                 `json:"repo_id"`
 	Exports  map[string]interface{} `json:"exports"`
 	Warnings []string               `json:"warnings,omitempty"`
+}
+
+// CommitHistoryItem represents a commit record stored in Postgres
+type CommitHistoryItem struct {
+	SHA               string   `json:"sha"`
+	AuthorName        string   `json:"author_name"`
+	AuthorEmail       string   `json:"author_email"`
+	Message           string   `json:"message"`
+	AuthoredAt        string   `json:"authored_at"`
+	ChangedFiles      []string `json:"changed_files"`
+	FilesChangedCount int      `json:"files_changed_count"`
+}
+
+type CommitHistoryResponse struct {
+	RepoID  string              `json:"repo_id"`
+	Commits []CommitHistoryItem `json:"commits"`
 }
 
 // Graph engine response types
@@ -167,13 +184,13 @@ type GraphEngineEdge struct {
 }
 
 type GraphEngineGraphResponse struct {
-	Nodes     []GraphEngineNode `json:"nodes"`
-	Edges     []GraphEngineEdge `json:"edges"`
-	TotalNodes int              `json:"total_nodes"`
-	TotalEdges int              `json:"total_edges"`
-	Limit     int              `json:"limit"`
-	Offset    int              `json:"offset"`
-	HasMore   bool             `json:"has_more"`
+	Nodes      []GraphEngineNode `json:"nodes"`
+	Edges      []GraphEngineEdge `json:"edges"`
+	TotalNodes int               `json:"total_nodes"`
+	TotalEdges int               `json:"total_edges"`
+	Limit      int               `json:"limit"`
+	Offset     int               `json:"offset"`
+	HasMore    bool              `json:"has_more"`
 }
 
 // Supported file extensions for code analysis
@@ -202,7 +219,7 @@ type AnalysisJob struct {
 	RepoURL     string            `json:"repo_url"`
 	Branch      string            `json:"branch"`
 	Status      string            `json:"status"`
-	Progress    int               `json:"progress"`    // 0-100
+	Progress    int               `json:"progress"` // 0-100
 	Options     map[string]string `json:"options"`
 	CreatedAt   time.Time         `json:"created_at"`
 	subscribers []chan JobUpdate  `json:"-"` // WebSocket subscribers for this job
@@ -235,13 +252,13 @@ type WebSocketClient struct {
 
 // WebSocketHub manages WebSocket connections and message broadcasting
 type WebSocketHub struct {
-	clients    map[string]*WebSocketClient // clientID -> client
-	jobClients map[string]map[string]bool  // jobID -> set of clientIDs
-	repoClients map[string]map[string]bool // repoID -> set of clientIDs
-	broadcast  chan JobUpdate
-	register   chan *WebSocketClient
-	unregister chan *WebSocketClient
-	mu         sync.RWMutex
+	clients     map[string]*WebSocketClient // clientID -> client
+	jobClients  map[string]map[string]bool  // jobID -> set of clientIDs
+	repoClients map[string]map[string]bool  // repoID -> set of clientIDs
+	broadcast   chan JobUpdate
+	register    chan *WebSocketClient
+	unregister  chan *WebSocketClient
+	mu          sync.RWMutex
 }
 
 // WebSocket upgrader
@@ -273,7 +290,7 @@ func (h *WebSocketHub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client.clientID] = client
-			
+
 			// Register for job-specific updates
 			if client.jobID != "" {
 				if h.jobClients[client.jobID] == nil {
@@ -282,7 +299,7 @@ func (h *WebSocketHub) Run() {
 				h.jobClients[client.jobID][client.clientID] = true
 				log.Printf("🔌 WebSocket client %s registered for job %s", client.clientID, client.jobID)
 			}
-			
+
 			// Register for repo-specific updates
 			if client.repoID != "" {
 				if h.repoClients[client.repoID] == nil {
@@ -298,7 +315,7 @@ func (h *WebSocketHub) Run() {
 			if _, ok := h.clients[client.clientID]; ok {
 				delete(h.clients, client.clientID)
 				close(client.send)
-				
+
 				// Unregister from job-specific updates
 				if client.jobID != "" {
 					delete(h.jobClients[client.jobID], client.clientID)
@@ -306,7 +323,7 @@ func (h *WebSocketHub) Run() {
 						delete(h.jobClients, client.jobID)
 					}
 				}
-				
+
 				// Unregister from repo-specific updates
 				if client.repoID != "" {
 					delete(h.repoClients[client.repoID], client.clientID)
@@ -314,7 +331,7 @@ func (h *WebSocketHub) Run() {
 						delete(h.repoClients, client.repoID)
 					}
 				}
-				
+
 				log.Printf("🔌 WebSocket client %s disconnected", client.clientID)
 			}
 			h.mu.Unlock()
@@ -322,7 +339,7 @@ func (h *WebSocketHub) Run() {
 		case update := <-h.broadcast:
 			h.mu.RLock()
 			var targetClients []*WebSocketClient
-			
+
 			// Determine which clients should receive this update
 			if update.JobID != "" {
 				// Send to clients subscribed to this job
@@ -332,7 +349,7 @@ func (h *WebSocketHub) Run() {
 					}
 				}
 			}
-			
+
 			if update.RepoID != "" {
 				// Send to clients subscribed to this repo
 				for clientID := range h.repoClients[update.RepoID] {
@@ -352,7 +369,7 @@ func (h *WebSocketHub) Run() {
 				}
 			}
 			h.mu.RUnlock()
-			
+
 			// Send update to target clients
 			for _, client := range targetClients {
 				select {
@@ -381,13 +398,13 @@ func (c *WebSocketClient) readPump() {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
-	
+
 	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	c.conn.SetPongHandler(func(string) error {
 		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
-	
+
 	for {
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
@@ -406,7 +423,7 @@ func (c *WebSocketClient) writePump() {
 		ticker.Stop()
 		c.conn.Close()
 	}()
-	
+
 	for {
 		select {
 		case update, ok := <-c.send:
@@ -416,13 +433,13 @@ func (c *WebSocketClient) writePump() {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-			
+
 			// Send JSON update
 			if err := c.conn.WriteJSON(update); err != nil {
 				log.Printf("⚠️  Error writing to WebSocket: %v", err)
 				return
 			}
-			
+
 		case <-ticker.C:
 			// Send ping to keep connection alive
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
@@ -666,6 +683,7 @@ func setupRouter() *gin.Engine {
 		// Repository management
 		v1.GET("/repositories", listRepositories)
 		v1.GET("/repositories/:id", getRepository)
+		v1.GET("/commits/:repo_id", listCommitHistory)
 
 		// Webhook management
 		v1.GET("/webhooks", listWebhooks)
@@ -707,20 +725,20 @@ func healthCheck(c *gin.Context) {
 // handleJobWebSocket handles WebSocket connections for job-specific updates
 func handleJobWebSocket(c *gin.Context) {
 	jobID := c.Param("job_id")
-	
+
 	// Validate job ID
 	if !validateUUID(jobID) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid job ID"})
 		return
 	}
-	
+
 	// Upgrade HTTP connection to WebSocket
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("⚠️  Failed to upgrade WebSocket: %v", err)
 		return
 	}
-	
+
 	// Create client
 	clientID := uuid.New().String()
 	client := &WebSocketClient{
@@ -730,34 +748,34 @@ func handleJobWebSocket(c *gin.Context) {
 		jobID:    jobID,
 		clientID: clientID,
 	}
-	
+
 	// Register client
 	wsHub.register <- client
-	
+
 	// Start goroutines for reading and writing
 	go client.writePump()
 	go client.readPump()
-	
+
 	log.Printf("✅ WebSocket connection established for job %s (client: %s)", jobID, clientID)
 }
 
 // handleRepoWebSocket handles WebSocket connections for repository-specific updates
 func handleRepoWebSocket(c *gin.Context) {
 	repoID := c.Param("repo_id")
-	
+
 	// Validate repo ID
 	if !validateUUID(repoID) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid repository ID"})
 		return
 	}
-	
+
 	// Upgrade HTTP connection to WebSocket
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("⚠️  Failed to upgrade WebSocket: %v", err)
 		return
 	}
-	
+
 	// Create client
 	clientID := uuid.New().String()
 	client := &WebSocketClient{
@@ -767,14 +785,14 @@ func handleRepoWebSocket(c *gin.Context) {
 		repoID:   repoID,
 		clientID: clientID,
 	}
-	
+
 	// Register client
 	wsHub.register <- client
-	
+
 	// Start goroutines for reading and writing
 	go client.writePump()
 	go client.readPump()
-	
+
 	log.Printf("✅ WebSocket connection established for repo %s (client: %s)", repoID, clientID)
 }
 
@@ -984,9 +1002,8 @@ func updateJob(c *gin.Context) {
 		finalStatus = *req.Status
 	}
 
-	// Get repo_id for WebSocket broadcast
-	var repoID string
-	db.QueryRow("SELECT repo_id FROM analysis_jobs WHERE job_id = $1", jobID).Scan(&repoID)
+	// Resolve repo UUID for WebSocket broadcast and commit storage
+	repoID, repoURL := resolveRepoUUID(jobID)
 
 	// Broadcast update via WebSocket
 	update := JobUpdate{
@@ -998,11 +1015,11 @@ func updateJob(c *gin.Context) {
 		ResultSummary: req.ResultSummary,
 		Timestamp:     time.Now(),
 	}
-	
+
 	if req.Progress != nil {
 		update.Progress = *req.Progress
 	}
-	
+
 	if req.Error != nil {
 		update.Type = "error"
 		update.Error = *req.Error
@@ -1011,6 +1028,14 @@ func updateJob(c *gin.Context) {
 	}
 
 	if update.Type != "error" && req.ResultSummary != nil {
+		if commits, err := extractCommitHistory(req.ResultSummary); err != nil {
+			log.Printf("Failed to parse commit history: %v", err)
+		} else if len(commits) > 0 {
+			if err := storeCommitHistory(repoID, repoURL, commits); err != nil {
+				log.Printf("Failed to store commit history: %v", err)
+			}
+		}
+
 		if _, ok := req.ResultSummary["graph_patch"]; ok {
 			update.Type = "graph_updated"
 			if changedNodes, ok := req.ResultSummary["changed_nodes"].([]interface{}); ok {
@@ -1029,7 +1054,7 @@ func updateJob(c *gin.Context) {
 			}
 		}
 	}
-	
+
 	wsHub.BroadcastJobUpdate(update)
 
 	log.Printf("📝 Updated job %s: status=%s", jobID, finalStatus)
@@ -1151,6 +1176,80 @@ func getRepository(c *gin.Context) {
 		"url":        url,
 		"owner_id":   ownerID,
 		"created_at": createdAt,
+	})
+}
+
+// listCommitHistory returns commit history for a repository UUID
+func listCommitHistory(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	if !validateUUID(repoID) {
+		validationError(c, "repo_id", "Invalid repository ID.")
+		return
+	}
+
+	limit := 200
+	if raw := c.Query("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			if parsed > 0 && parsed <= 2000 {
+				limit = parsed
+			}
+		}
+	}
+
+	rows, err := db.Query(`
+		SELECT commit_sha, author_name, author_email, authored_at, message, changed_files, files_changed_count
+		FROM commit_history
+		WHERE repo_uuid = $1
+		ORDER BY authored_at DESC NULLS LAST
+		LIMIT $2
+	`, repoID, limit)
+	if err != nil {
+		log.Printf("Database error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to retrieve commit history",
+		})
+		return
+	}
+	defer rows.Close()
+
+	commits := []CommitHistoryItem{}
+	for rows.Next() {
+		var sha string
+		var authorName sql.NullString
+		var authorEmail sql.NullString
+		var authoredAt sql.NullTime
+		var message sql.NullString
+		var changedFilesJSON []byte
+		var filesChangedCount int
+
+		if err := rows.Scan(&sha, &authorName, &authorEmail, &authoredAt, &message, &changedFilesJSON, &filesChangedCount); err != nil {
+			log.Printf("Scan error: %v", err)
+			continue
+		}
+
+		var changedFiles []string
+		if len(changedFilesJSON) > 0 {
+			_ = json.Unmarshal(changedFilesJSON, &changedFiles)
+		}
+
+		commit := CommitHistoryItem{
+			SHA:               sha,
+			AuthorName:        authorName.String,
+			AuthorEmail:       authorEmail.String,
+			Message:           message.String,
+			AuthoredAt:        "",
+			ChangedFiles:      changedFiles,
+			FilesChangedCount: filesChangedCount,
+		}
+		if authoredAt.Valid {
+			commit.AuthoredAt = authoredAt.Time.UTC().Format(time.RFC3339)
+		}
+		commits = append(commits, commit)
+	}
+
+	c.JSON(http.StatusOK, CommitHistoryResponse{
+		RepoID:  repoID,
+		Commits: commits,
 	})
 }
 
@@ -1336,9 +1435,9 @@ func pingWebhook(c *gin.Context) {
 	}
 
 	payload := map[string]interface{}{
-		"zen":      "ArchMind webhook test",
-		"hook_id":  id,
-		"sent_at":  time.Now().UTC().Format(time.RFC3339),
+		"zen":     "ArchMind webhook test",
+		"hook_id": id,
+		"sent_at": time.Now().UTC().Format(time.RFC3339),
 	}
 	body, _ := json.Marshal(payload)
 
@@ -1563,6 +1662,115 @@ func updateJobInDB(jobID string, req JobUpdateRequest) (time.Time, error) {
 	return updatedAt, nil
 }
 
+func resolveRepoUUID(jobID string) (string, string) {
+	var repoURL string
+	if err := db.QueryRow("SELECT repo_url FROM analysis_jobs WHERE job_id = $1", jobID).Scan(&repoURL); err != nil {
+		return "", ""
+	}
+	return generateRepoID(repoURL), repoURL
+}
+
+func extractCommitHistory(summary map[string]interface{}) ([]CommitHistoryItem, error) {
+	raw, ok := summary["commit_history"]
+	if !ok {
+		return nil, nil
+	}
+
+	payload, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	var commits []CommitHistoryItem
+	if err := json.Unmarshal(payload, &commits); err != nil {
+		return nil, err
+	}
+	return commits, nil
+}
+
+func parseCommitTime(value string) sql.NullTime {
+	if value == "" {
+		return sql.NullTime{}
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return sql.NullTime{Time: parsed.UTC(), Valid: true}
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return sql.NullTime{Time: parsed.UTC(), Valid: true}
+	}
+	return sql.NullTime{}
+}
+
+func storeCommitHistory(repoID string, repoURL string, commits []CommitHistoryItem) error {
+	if repoID == "" || len(commits) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO commit_history (
+			repo_uuid,
+			repo_url,
+			commit_sha,
+			author_name,
+			author_email,
+			authored_at,
+			message,
+			changed_files,
+			files_changed_count
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (repo_uuid, commit_sha)
+		DO UPDATE SET
+			author_name = EXCLUDED.author_name,
+			author_email = EXCLUDED.author_email,
+			authored_at = EXCLUDED.authored_at,
+			message = EXCLUDED.message,
+			changed_files = EXCLUDED.changed_files,
+			files_changed_count = EXCLUDED.files_changed_count
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+
+	for _, commit := range commits {
+		filesChangedCount := commit.FilesChangedCount
+		if filesChangedCount == 0 {
+			filesChangedCount = len(commit.ChangedFiles)
+		}
+
+		changedFilesJSON, _ := json.Marshal(commit.ChangedFiles)
+		authoredAt := parseCommitTime(commit.AuthoredAt)
+
+		if _, err = stmt.Exec(
+			repoID,
+			repoURL,
+			commit.SHA,
+			commit.AuthorName,
+			commit.AuthorEmail,
+			authoredAt,
+			commit.Message,
+			changedFilesJSON,
+			filesChangedCount,
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 // getEnv retrieves an environment variable with a fallback default value
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
@@ -1591,7 +1799,22 @@ func handleGitHubWebhook(c *gin.Context) {
 
 	// Step 2: Determine event type and resolve secret
 	eventType := c.GetHeader("X-GitHub-Event")
-	secretOverride := resolveWebhookSecret(eventType, body)
+	contentType := c.GetHeader("Content-Type")
+
+	payloadBody := body
+	if eventType == "push" || eventType == "pull_request" || eventType == "ping" {
+		payloadBody, err = extractGitHubJSONPayload(body, contentType)
+		if err != nil {
+			log.Printf("❌ Webhook: Failed to decode payload (event=%s, content_type=%s): %v", eventType, contentType, err)
+			c.JSON(http.StatusBadRequest, WebhookResponse{
+				Status:  "error",
+				Message: "Invalid webhook payload format",
+			})
+			return
+		}
+	}
+
+	secretOverride := resolveWebhookSecret(eventType, payloadBody)
 
 	// Step 3: Verify the signature (security check)
 	signature := c.GetHeader("X-Hub-Signature-256")
@@ -1612,9 +1835,9 @@ func handleGitHubWebhook(c *gin.Context) {
 	// Step 5: Route to appropriate handler based on event type
 	switch eventType {
 	case "push":
-		handlePushEvent(c, body)
+		handlePushEvent(c, payloadBody)
 	case "pull_request":
-		handlePullRequestEvent(c, body)
+		handlePullRequestEvent(c, payloadBody)
 	case "ping":
 		// GitHub sends a ping event when webhook is first configured
 		c.JSON(http.StatusOK, WebhookResponse{
@@ -1678,6 +1901,13 @@ func resolveWebhookSecret(eventType string, payload []byte) string {
 		if err := json.Unmarshal(payload, &pr); err == nil {
 			repoURL = pr.Repository.CloneURL
 		}
+	case "ping":
+		var ping struct {
+			Repository GitHubRepository `json:"repository"`
+		}
+		if err := json.Unmarshal(payload, &ping); err == nil {
+			repoURL = ping.Repository.CloneURL
+		}
 	}
 
 	if repoURL == "" {
@@ -1699,6 +1929,38 @@ func resolveWebhookSecret(eventType string, payload []byte) string {
 	}
 
 	return secret.String
+}
+
+func extractGitHubJSONPayload(body []byte, contentType string) ([]byte, error) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("empty request body")
+	}
+
+	if json.Valid(trimmed) {
+		return trimmed, nil
+	}
+
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	if mediaType == "application/x-www-form-urlencoded" || bytes.HasPrefix(trimmed, []byte("payload=")) {
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse form payload: %w", err)
+		}
+
+		payload := strings.TrimSpace(values.Get("payload"))
+		if payload == "" {
+			return nil, fmt.Errorf("missing payload field in form body")
+		}
+
+		payloadBytes := []byte(payload)
+		if !json.Valid(payloadBytes) {
+			return nil, fmt.Errorf("decoded payload is not valid JSON")
+		}
+		return payloadBytes, nil
+	}
+
+	return nil, fmt.Errorf("unsupported payload format: %s", mediaType)
 }
 
 func signGitHubPayload(payload []byte, secret string) string {
@@ -2072,6 +2334,7 @@ func hasAnalyzableFiles(files []string) bool {
 // createWebhookAnalysisJob creates a new analysis job from a webhook event
 func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []string, removedFiles []string) (string, error) {
 	jobID := uuid.New().String()
+	repoID := generateRepoID(repoURL)
 
 	// Build options with webhook metadata
 	options := map[string]string{
@@ -2106,6 +2369,7 @@ func createWebhookAnalysisJob(repoURL, branch, trigger string, changedFiles []st
 
 	job := AnalysisJob{
 		JobID:     jobID,
+		RepoID:    repoID,
 		RepoURL:   repoURL,
 		Branch:    branch,
 		Status:    "QUEUED",
