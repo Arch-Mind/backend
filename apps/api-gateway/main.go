@@ -647,7 +647,24 @@ func setupRouter() *gin.Engine {
 
 	// CORS middleware
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000"},
+		AllowOriginFunc: func(origin string) bool {
+			if origin == "" {
+				return true
+			}
+
+			normalized := strings.ToLower(strings.TrimSpace(origin))
+			switch {
+			case strings.HasPrefix(normalized, "http://localhost:"),
+				strings.HasPrefix(normalized, "https://localhost:"),
+				strings.HasPrefix(normalized, "http://127.0.0.1:"),
+				strings.HasPrefix(normalized, "https://127.0.0.1:"),
+				strings.HasPrefix(normalized, "vscode-webview://"),
+				strings.HasPrefix(normalized, "vscode-file://"):
+				return true
+			default:
+				return false
+			}
+		},
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
