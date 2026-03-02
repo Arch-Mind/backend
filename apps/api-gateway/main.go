@@ -721,6 +721,7 @@ func setupRouter() *gin.Engine {
 	{
 		// Repository analysis
 		v1.POST("/analyze", analyzeRepository)
+		v1.GET("/analyze/impact", analyzeImpact)
 		v1.GET("/jobs/:id", getJobStatus)
 		v1.PATCH("/jobs/:id", updateJob)
 		v1.GET("/jobs", listJobs)
@@ -736,6 +737,9 @@ func setupRouter() *gin.Engine {
 		v1.DELETE("/webhooks/:id", deleteWebhook)
 		v1.POST("/webhooks/:id/ping", pingWebhook)
 	}
+
+	// Alias exact path for Reverse Analysis Impact
+	router.GET("/api/analyze/impact", analyzeImpact)
 
 	// Export endpoint
 	router.POST("/api/export/:repo_id", exportRepository)
@@ -937,6 +941,53 @@ func analyzeRepository(c *gin.Context) {
 		Message:   "Analysis job created successfully",
 		CreatedAt: job.CreatedAt,
 	})
+}
+
+// analyzeImpact forwards the request to the graph engine to get impacted files
+func analyzeImpact(c *gin.Context) {
+	filePath := c.Query("file_path")
+	repoID := c.Query("repo_id")
+	if filePath == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Missing file_path query parameter",
+		})
+		return
+	}
+
+	graphEngineURL := getEnv("GRAPH_ENGINE_URL", "http://graph-engine:8000")
+	// Prepare connection to graph engine
+	requestURL := fmt.Sprintf("%s/api/analyze/impact?file_path=%s", graphEngineURL, url.QueryEscape(filePath))
+	if repoID != "" {
+		requestURL += fmt.Sprintf("&repo_id=%s", url.QueryEscape(repoID))
+	}
+
+	resp, err := http.Get(requestURL)
+	if err != nil {
+		log.Printf("Failed to reach graph engine for reverse impact analysis: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "Graph engine unavailable",
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":  "Graph engine returned an error",
+			"status": resp.StatusCode,
+		})
+		return
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to decode graph engine response",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
 }
 
 // getJobStatus retrieves the status of a specific job

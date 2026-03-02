@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     libgcc-s1 \
+    dos2unix \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/
@@ -33,7 +34,7 @@ COPY --from=builder /app/target/release/ingestion-worker .
 
 # Entry point wrapper for startup diagnostics
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN dos2unix /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 # Run the binary
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
