@@ -459,6 +459,157 @@ async def get_repository_metrics(repo_id: str):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+def calculate_impact_severity(pagerank: float, churn: int, dependent_count: int) -> dict:
+    """
+    Calculates a risk score (0-100) and maps it to a severity tier based on:
+    - PageRank (0 to 1 scale, higher is more central)
+    - Commit churn (number of times the file has changed)
+    - Dependent count (number of upstream components affected)
+    """
+    # Normalize inputs (applying arbitrary caps for the sake of the algorithm)
+    # Assume max churn of ~50 is very high, max dependents of ~100 is very high
+    normalized_pagerank = min(pagerank * 10, 1.0) # PageRank is usually very small, boost it
+    normalized_churn = min(churn / 50.0, 1.0)
+    normalized_dependents = min(dependent_count / 100.0, 1.0)
+    
+    # Weighted Score (0 to 1) 
+    # Weights: 40% Dependents, 30% PageRank, 30% Churn
+    raw_score = (normalized_dependents * 0.4) + (normalized_pagerank * 0.3) + (normalized_churn * 0.3)
+    
+    # Scale to 0-100
+    final_score = round(raw_score * 100)
+    
+    # Map to Severity Tiers
+    if final_score >= 75:
+        tier = "Critical"
+    elif final_score >= 50:
+        tier = "High"
+    elif final_score >= 25:
+        tier = "Medium"
+    else:
+        tier = "Low"
+        
+    return {
+        "score": final_score,
+        "tier": tier
+    }
+
+
+@app.get("/api/analyze/impact")
+async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
+    """
+    Perform a reverse Breadth-First Search (BFS) to find all upstream components
+    that depend on the specified file (Issue #22), restricted by repo_id if provided.
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+
+    try:
+        with neo4j_driver.session() as session:
+            if repo_id:
+                query = """
+                MATCH path = (upstream)-[:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS*1..5]->(target:File {path: $file_path})
+                WHERE (upstream.repo_id = $repo_id OR upstream.job_id = $repo_id) 
+                  AND (target.repo_id = $repo_id OR target.job_id = $repo_id)
+                RETURN DISTINCT 
+                       upstream.path as upstream_file,
+                       upstream.name as upstream_name,
+                       labels(upstream)[0] as upstream_type,
+                       length(path) as depth
+                ORDER BY depth
+                LIMIT 500
+                """
+                result = session.run(query, file_path=file_path, repo_id=repo_id)
+            else:
+                query = """
+                MATCH path = (upstream)-[:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS*1..5]->(target:File {path: $file_path})
+                RETURN DISTINCT 
+                       upstream.path as upstream_file,
+                       upstream.name as upstream_name,
+                       labels(upstream)[0] as upstream_type,
+                       length(path) as depth
+                ORDER BY depth
+                LIMIT 500
+                """
+                result = session.run(query, file_path=file_path)
+            
+            upstream_components = []
+            for record in result:
+                identifier = record["upstream_file"] if record["upstream_file"] else record["upstream_name"]
+                if not identifier:
+                    continue
+                    
+                upstream_components.append({
+                    "id": identifier,
+                    "type": record["upstream_type"],
+                    "depth": record["depth"]
+                })
+
+            pagerank_score = 0.0
+            try:
+                if repo_id:
+                    pr_query = """
+                    MATCH (a)-[r:CALLS|IMPORTS|DEPENDS_ON]->(b)
+                    WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) 
+                      AND (b.repo_id = $repo_id OR b.job_id = $repo_id)
+                    RETURN a.path as source, b.path as target
+                    """
+                    pr_result = session.run(pr_query, repo_id=repo_id)
+                else:
+                    pr_query = """
+                    MATCH (a)-[r:CALLS|IMPORTS|DEPENDS_ON]->(b)
+                    RETURN a.path as source, b.path as target
+                    """
+                    pr_result = session.run(pr_query)
+                
+                G = nx.DiGraph()
+                for record in pr_result:
+                    if record["source"] and record["target"]:
+                        G.add_edge(record["source"], record["target"])
+                        
+                if len(G.nodes()) > 0:
+                    pageranks = nx.pagerank(G)
+                    pagerank_score = pageranks.get(file_path, 0.0)
+            except Exception as e:
+                logger.warning(f"Could not calculate pagerank: {e}")
+
+            churn_val = 0
+            if repo_id:
+                churn_query = """
+                MATCH (f:File {path: $file_path}) 
+                WHERE f.repo_id = $repo_id OR f.job_id = $repo_id 
+                RETURN coalesce(f.commits_count, 12) as churn
+                """
+                churn_result = session.run(churn_query, file_path=file_path, repo_id=repo_id).single()
+            else:
+                churn_query = "MATCH (f:File {path: $file_path}) RETURN coalesce(f.commits_count, 12) as churn"
+                churn_result = session.run(churn_query, file_path=file_path).single()
+
+            if churn_result:
+                churn_val = churn_result["churn"]
+
+            dependent_count = len(upstream_components)
+            severity = calculate_impact_severity(pagerank_score, churn_val, dependent_count)
+
+            return {
+                "target_file": file_path,
+                "impact_count": dependent_count,
+                "upstream_dependencies": upstream_components,
+                "severity_score": severity["score"],
+                "severity_tier": severity["tier"],
+                "metrics": {
+                    "pagerank": round(pagerank_score, 6),
+                    "churn": churn_val
+                }
+            }
+            
+    except Exception as e:
+        logger.error(f"Reverse impact analysis error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
 @app.get("/api/graph/{repo_id}")
 async def get_dependency_graph(repo_id: str, limit: int = 100, offset: int = 0):
     """
