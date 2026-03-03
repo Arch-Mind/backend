@@ -529,11 +529,16 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                 
             if path_res and path_res["db_path"]:
                 actual_path = path_res["db_path"]
-
+            else:
+                # If absolute path lookup missed entirely, at least attempt normalized unix path without drive letter
+                if ':' in normalized_path:
+                    actual_path = normalized_path.split(':', 1)[-1].lstrip('/')
+                else:
+                    actual_path = normalized_path
 
             if repo_id:
                 query = """
-                MATCH path = (upstream)-[:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS*1..5]->(target:File {path: $file_path})
+                MATCH path = (upstream)-[:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS*1..5]->(target:File {path: $actual_path})
                 WHERE (upstream.repo_id = $repo_id OR upstream.job_id = $repo_id) 
                   AND (target.repo_id = $repo_id OR target.job_id = $repo_id)
                 RETURN DISTINCT 
@@ -544,10 +549,10 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                 ORDER BY depth
                 LIMIT 500
                 """
-                result = session.run(query, file_path=actual_path, repo_id=repo_id)
+                result = session.run(query, actual_path=actual_path, repo_id=repo_id)
             else:
                 query = """
-                MATCH path = (upstream)-[:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS*1..5]->(target:File {path: $file_path})
+                MATCH path = (upstream)-[:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS*1..5]->(target:File {path: $actual_path})
                 RETURN DISTINCT 
                        upstream.path as upstream_file,
                        upstream.name as upstream_name,
@@ -556,7 +561,7 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                 ORDER BY depth
                 LIMIT 500
                 """
-                result = session.run(query, file_path=actual_path)
+                result = session.run(query, actual_path=actual_path)
             
             upstream_components = []
             for record in result:
