@@ -459,7 +459,37 @@ async def get_repository_metrics(repo_id: str):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-from scoring_logic import calculate_impact_severity
+try:
+    from scoring_logic import calculate_impact_severity
+except ImportError:
+    # Fallback: inline implementation so the service never crashes on import
+    def calculate_impact_severity(pagerank: float, churn: int, dependents: int) -> dict:
+        MAX_PAGERANK = 3.0
+        MAX_CHURN = 50
+        MAX_DEPENDENTS = 100
+        WEIGHT_PAGERANK = 0.30
+        WEIGHT_CHURN = 0.30
+        WEIGHT_DEPENDENTS = 0.40
+
+        norm_pr = min(pagerank / MAX_PAGERANK, 1.0) if MAX_PAGERANK > 0 else 0
+        norm_churn = min(churn / MAX_CHURN, 1.0) if MAX_CHURN > 0 else 0
+        norm_dep = min(dependents / MAX_DEPENDENTS, 1.0) if MAX_DEPENDENTS > 0 else 0
+
+        raw = (norm_pr * WEIGHT_PAGERANK) + (norm_churn * WEIGHT_CHURN) + (norm_dep * WEIGHT_DEPENDENTS)
+        score = int(round(raw * 100))
+        score = max(0, min(score, 100))
+
+        if score >= 76:
+            tier = "Critical"
+        elif score >= 51:
+            tier = "High"
+        elif score >= 26:
+            tier = "Medium"
+        else:
+            tier = "Low"
+
+        return {"score": score, "tier": tier}
+    logger.warning("scoring_logic module not found, using inline fallback")
 
 
 @app.get("/api/analyze/impact")
