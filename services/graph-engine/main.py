@@ -506,6 +506,31 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
 
     try:
         with neo4j_driver.session() as session:
+            # The frontend may send absolute paths while the ingestion engine usually stores relative paths.
+            # Resolve the accurate internal db path before querying impact:
+            normalized_path = file_path.replace('\\', '/')
+            actual_path = file_path
+            
+            if repo_id:
+                path_q = """
+                MATCH (t:File) 
+                WHERE (t.repo_id = $repo_id OR t.job_id = $repo_id) 
+                  AND (t.path = $orig_path OR $norm_path ENDS WITH t.path) 
+                RETURN t.path as db_path LIMIT 1
+                """
+                path_res = session.run(path_q, repo_id=repo_id, orig_path=file_path, norm_path=normalized_path).single()
+            else:
+                path_q = """
+                MATCH (t:File) 
+                WHERE t.path = $orig_path OR $norm_path ENDS WITH t.path
+                RETURN t.path as db_path LIMIT 1
+                """
+                path_res = session.run(path_q, orig_path=file_path, norm_path=normalized_path).single()
+                
+            if path_res and path_res["db_path"]:
+                actual_path = path_res["db_path"]
+
+
             if repo_id:
                 query = """
                 MATCH path = (upstream)-[:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS*1..5]->(target:File {path: $file_path})
@@ -519,7 +544,7 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                 ORDER BY depth
                 LIMIT 500
                 """
-                result = session.run(query, file_path=file_path, repo_id=repo_id)
+                result = session.run(query, file_path=actual_path, repo_id=repo_id)
             else:
                 query = """
                 MATCH path = (upstream)-[:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS*1..5]->(target:File {path: $file_path})
@@ -531,7 +556,7 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                 ORDER BY depth
                 LIMIT 500
                 """
-                result = session.run(query, file_path=file_path)
+                result = session.run(query, file_path=actual_path)
             
             upstream_components = []
             for record in result:
@@ -569,7 +594,7 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                         
                 if len(G.nodes()) > 0:
                     pageranks = nx.pagerank(G)
-                    pagerank_score = pageranks.get(file_path, 0.0)
+                    pagerank_score = pageranks.get(actual_path, 0.0)
             except Exception as e:
                 logger.warning(f"Could not calculate pagerank: {e}")
 
@@ -580,10 +605,10 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                 WHERE f.repo_id = $repo_id OR f.job_id = $repo_id 
                 RETURN coalesce(f.commits_count, 12) as churn
                 """
-                churn_result = session.run(churn_query, file_path=file_path, repo_id=repo_id).single()
+                churn_result = session.run(churn_query, file_path=actual_path, repo_id=repo_id).single()
             else:
                 churn_query = "MATCH (f:File {path: $file_path}) RETURN coalesce(f.commits_count, 12) as churn"
-                churn_result = session.run(churn_query, file_path=file_path).single()
+                churn_result = session.run(churn_query, file_path=actual_path).single()
 
             if churn_result:
                 churn_val = churn_result["churn"]
