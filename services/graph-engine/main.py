@@ -515,14 +515,14 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                 path_q = """
                 MATCH (t:File) 
                 WHERE (t.repo_id = $repo_id OR t.job_id = $repo_id) 
-                  AND (t.path = $orig_path OR $norm_path ENDS WITH t.path) 
+                  AND (t.path = $orig_path OR $norm_path ENDS WITH t.path OR t.path ENDS WITH $norm_path) 
                 RETURN t.path as db_path LIMIT 1
                 """
                 path_res = session.run(path_q, repo_id=repo_id, orig_path=file_path, norm_path=normalized_path).single()
             else:
                 path_q = """
                 MATCH (t:File) 
-                WHERE t.path = $orig_path OR $norm_path ENDS WITH t.path
+                WHERE t.path = $orig_path OR $norm_path ENDS WITH t.path OR t.path ENDS WITH $norm_path
                 RETURN t.path as db_path LIMIT 1
                 """
                 path_res = session.run(path_q, orig_path=file_path, norm_path=normalized_path).single()
@@ -530,8 +530,15 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
             if path_res and path_res["db_path"]:
                 actual_path = path_res["db_path"]
             else:
-                # If absolute path lookup missed entirely, at least attempt normalized unix path without drive letter
-                if ':' in normalized_path:
+                # GLOBAL FALLBACK: If we couldn't find the file by its path/repo, 
+                # search the whole DB for any node with this filename.
+                filename = os.path.basename(normalized_path)
+                fallback_q = "MATCH (f:File {name: $filename}) RETURN f.path as db_path LIMIT 1"
+                fallback_res = session.run(fallback_q, filename=filename).single()
+                
+                if fallback_res:
+                    actual_path = fallback_res["db_path"]
+                elif ':' in normalized_path:
                     actual_path = normalized_path.split(':', 1)[-1].lstrip('/')
                 else:
                     actual_path = normalized_path
@@ -582,13 +589,13 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                     MATCH (a)-[r:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS]->(b)
                     WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) 
                       AND (b.repo_id = $repo_id OR b.job_id = $repo_id)
-                    RETURN coalesce(a.path, a.name, elementId(a)) as source, coalesce(b.path, b.name, elementId(b)) as target
+                    RETURN coalesce(a.path, a.name, "unknown_source") as source, coalesce(b.path, b.name, "unknown_target") as target
                     """
                     pr_result = session.run(pr_query, repo_id=repo_id)
                 else:
                     pr_query = """
                     MATCH (a)-[r:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS]->(b)
-                    RETURN coalesce(a.path, a.name, elementId(a)) as source, coalesce(b.path, b.name, elementId(b)) as target
+                    RETURN coalesce(a.path, a.name, "unknown_source") as source, coalesce(b.path, b.name, "unknown_target") as target
                     """
                     pr_result = session.run(pr_query)
                 
@@ -597,13 +604,15 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                     if record["source"] and record["target"]:
                         G.add_edge(record["source"], record["target"])
                         
-                if len(G.nodes()) > 0:
-                    pageranks = nx.pagerank(G)
+                graph_node_count = len(G.nodes())
+                if graph_node_count > 0:
+                    pageranks = nx.pagerank(G, max_iter=500)
                     raw_pagerank = pageranks.get(actual_path, 0.0)
                     # Scale PageRank to roughly 0-100 range by multiplying by number of nodes
                     # Since sum(pageranks) = 1.0, this makes the *average* pagerank 1.0. 
-                    pagerank_score = raw_pagerank * len(G.nodes())
+                    pagerank_score = raw_pagerank * graph_node_count
             except Exception as e:
+                graph_node_count = -1
                 logger.warning(f"Could not calculate pagerank: {e}")
 
             churn_val = 0
@@ -632,7 +641,8 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                 "severity_tier": severity["tier"],
                 "metrics": {
                     "pagerank": round(pagerank_score, 6),
-                    "churn": churn_val
+                    "churn": churn_val,
+                    "graph_node_count": graph_node_count
                 }
             }
             

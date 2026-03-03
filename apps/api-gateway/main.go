@@ -722,7 +722,6 @@ func setupRouter() *gin.Engine {
 		// Repository analysis
 		v1.POST("/analyze", analyzeRepository)
 		v1.GET("/analyze/impact", analyzeImpact)
-		v1.GET("/jobs/:id", getJobStatus)
 		v1.PATCH("/jobs/:id", updateJob)
 		v1.GET("/jobs", listJobs)
 
@@ -931,16 +930,76 @@ func analyzeRepository(c *gin.Context) {
 		return
 	}
 
-	log.Printf("📝 Created analysis job: %s for repo: %s (ID: %s)", jobID, req.RepoURL, repoID)
+	log.Printf("📝 Created analysis job: %s for repo: %s (ID: %s). Waiting for completion...", jobID, req.RepoURL, repoID)
 
-	// Return response
-	c.JSON(http.StatusCreated, JobResponse{
-		JobID:     jobID,
-		RepoID:    repoID,
-		Status:    "QUEUED",
-		Message:   "Analysis job created successfully",
-		CreatedAt: job.CreatedAt,
-	})
+	// ==========================================
+	// SYNCHRONOUS BLOCKING LOGIC
+	// ==========================================
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	// 10 minute timeout for large repos
+	timeout := time.After(10 * time.Minute)
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check status from DB
+			var currentStatus string
+			err := db.QueryRow("SELECT status FROM analysis_jobs WHERE job_id = $1", jobID).Scan(&currentStatus)
+			if err != nil {
+				log.Printf("Error checking job status: %v", err)
+				continue
+			}
+
+			if currentStatus == "COMPLETED" {
+				log.Printf("✅ Job %s completed. Returning success.", jobID)
+
+				// Fetch full job details for response
+				var finalJob AnalysisJob
+				var optionsBytes []byte
+				err = db.QueryRow(`
+					SELECT job_id, repo_url, branch, status, options, created_at 
+					FROM analysis_jobs WHERE job_id = $1
+				`, jobID).Scan(&finalJob.JobID, &finalJob.RepoURL, &finalJob.Branch, &finalJob.Status, &optionsBytes, &finalJob.CreatedAt)
+
+				if len(optionsBytes) > 0 {
+					json.Unmarshal(optionsBytes, &finalJob.Options)
+				}
+				finalJob.RepoID = repoID
+
+				c.JSON(http.StatusOK, finalJob)
+				return
+			}
+
+			if currentStatus == "FAILED" {
+				var errMsg sql.NullString
+				db.QueryRow("SELECT error_message FROM analysis_jobs WHERE job_id = $1", jobID).Scan(&errMsg)
+
+				log.Printf("❌ Job %s failed: %s", jobID, errMsg.String)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error":   "Analysis failed",
+					"job_id":  jobID,
+					"message": errMsg.String,
+				})
+				return
+			}
+
+		case <-timeout:
+			log.Printf("⏳ Job %s timed out after 10 minutes", jobID)
+			c.JSON(http.StatusGatewayTimeout, gin.H{
+				"error":  "Analysis timed out",
+				"job_id": jobID,
+				"status": "PROCESSING",
+			})
+			return
+
+		case <-c.Request.Context().Done():
+			// Client disconnected
+			log.Printf("🔌 Client disconnected while waiting for job %s", jobID)
+			return
+		}
+	}
 }
 
 // analyzeImpact forwards the request to the graph engine to get impacted files
