@@ -462,13 +462,13 @@ async def get_repository_metrics(repo_id: str):
 def calculate_impact_severity(pagerank: float, churn: int, dependent_count: int) -> dict:
     """
     Calculates a risk score (0-100) and maps it to a severity tier based on:
-    - PageRank (0 to 1 scale, higher is more central)
+    - PageRank (Normalized so average node = 1.0, highly central > 3.0)
     - Commit churn (number of times the file has changed)
     - Dependent count (number of upstream components affected)
     """
     # Normalize inputs (applying arbitrary caps for the sake of the algorithm)
     # Assume max churn of ~50 is very high, max dependents of ~100 is very high
-    normalized_pagerank = min(pagerank * 10, 1.0) # PageRank is usually very small, boost it
+    normalized_pagerank = min(pagerank / 3.0, 1.0) # PageRank is scaled by N nodes, average is 1.0
     normalized_churn = min(churn / 50.0, 1.0)
     normalized_dependents = min(dependent_count / 100.0, 1.0)
     
@@ -579,16 +579,16 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
             try:
                 if repo_id:
                     pr_query = """
-                    MATCH (a)-[r:CALLS|IMPORTS|DEPENDS_ON]->(b)
+                    MATCH (a)-[r:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS]->(b)
                     WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) 
                       AND (b.repo_id = $repo_id OR b.job_id = $repo_id)
-                    RETURN a.path as source, b.path as target
+                    RETURN coalesce(a.path, a.name, elementId(a)) as source, coalesce(b.path, b.name, elementId(b)) as target
                     """
                     pr_result = session.run(pr_query, repo_id=repo_id)
                 else:
                     pr_query = """
-                    MATCH (a)-[r:CALLS|IMPORTS|DEPENDS_ON]->(b)
-                    RETURN a.path as source, b.path as target
+                    MATCH (a)-[r:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS]->(b)
+                    RETURN coalesce(a.path, a.name, elementId(a)) as source, coalesce(b.path, b.name, elementId(b)) as target
                     """
                     pr_result = session.run(pr_query)
                 
@@ -599,7 +599,10 @@ async def get_reverse_impact_analysis(file_path: str, repo_id: str = None):
                         
                 if len(G.nodes()) > 0:
                     pageranks = nx.pagerank(G)
-                    pagerank_score = pageranks.get(actual_path, 0.0)
+                    raw_pagerank = pageranks.get(actual_path, 0.0)
+                    # Scale PageRank to roughly 0-100 range by multiplying by number of nodes
+                    # Since sum(pageranks) = 1.0, this makes the *average* pagerank 1.0. 
+                    pagerank_score = raw_pagerank * len(G.nodes())
             except Exception as e:
                 logger.warning(f"Could not calculate pagerank: {e}")
 
