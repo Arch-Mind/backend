@@ -244,6 +244,49 @@ def test_graph_endpoint_has_more_flag(mock_driver):
     # (mocking this would require adjusting side_effect)
 
 
+@patch('main.neo4j_driver')
+def test_graph_files_endpoint_pagination(mock_driver):
+    """Test file dependency graph endpoint supports pagination."""
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    
+    # Mock repo exists
+    mock_exists_result = MagicMock()
+    mock_exists_result.single.return_value = {"count": 1}
+    
+    # Mock counts
+    mock_count_result = MagicMock()
+    mock_count_result.single.return_value = {"count": 100}
+    
+    # Mock nodes and edges
+    mock_nodes_result = MagicMock()
+    mock_nodes_result.__iter__ = Mock(return_value=iter([
+        {"id": "node1", "name": "test.py", "type": "File", "props": {}}
+    ]))
+    
+    mock_edges_result = MagicMock()
+    mock_edges_result.__iter__ = Mock(return_value=iter([]))
+    
+    mock_session.run.side_effect = [
+        mock_exists_result,    # check_repo_exists
+        mock_count_result,     # total nodes count
+        mock_count_result,     # total edges count
+        mock_nodes_result,     # nodes query
+        mock_edges_result      # edges query
+    ]
+    
+    valid_uuid = "550e8400-e29b-41d4-a716-446655440000"
+    response = client.get(f"/api/graph/files?repo_id={valid_uuid}&limit=10&offset=0")
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert "limit" in data
+    assert "offset" in data
+    assert "has_more" in data
+    assert data["limit"] == 10
+    assert data["offset"] == 0
+
+
 # ================================
 # Test 5: Index Creation
 # ================================

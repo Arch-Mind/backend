@@ -768,6 +768,124 @@ async def get_dependency_graph(repo_id: str, limit: int = 100, offset: int = 0):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@app.get("/api/graph/files")
+async def get_file_dependency_graph(repo_id: str, limit: int = 100, offset: int = 0):
+    """
+    Retrieve the dependency graph specifically for File nodes.
+    repo_id is the job_id from the analysis job.
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+
+    # Validate repo_id format
+    if not validate_repo_id(repo_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid repo_id format. Expected UUID, got: {repo_id}"
+        )
+
+    # Validate and normalize pagination parameters
+    limit, offset = validate_pagination_params(limit, offset)
+
+    try:
+        with neo4j_driver.session() as session:
+            # Check if repo exists
+            repo_exists = await check_repo_exists(session, repo_id)
+            if not repo_exists:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Repository not found: {repo_id}. Please ensure the analysis job has completed successfully."
+                )
+
+            # Get total count of File nodes
+            total_nodes_query = "MATCH (n:File) WHERE n.repo_id = $repo_id OR n.job_id = $repo_id RETURN count(n) as count"
+            total_nodes = await get_total_count(session, total_nodes_query, repo_id)
+
+            # Get total count of edges between File nodes
+            total_edges_query = "MATCH (a:File)-[r:IMPORTS|DEPENDS_ON]->(b:File) WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) AND (b.repo_id = $repo_id OR b.job_id = $repo_id) RETURN count(r) as count"
+            total_edges = await get_total_count(session, total_edges_query, repo_id)
+
+            # Get File nodes with pagination
+            nodes_query = \"\"\"
+            MATCH (n:File)
+            WHERE n.repo_id = $repo_id OR n.job_id = $repo_id
+            RETURN 
+                COALESCE(n.path, n.name, n.id, toString(id(n))) as id,
+                COALESCE(n.name, n.path, toString(id(n))) as name,
+                labels(n)[0] as type,
+                properties(n) as props
+            SKIP $offset
+            LIMIT $limit
+            \"\"\"
+            nodes_result = session.run(nodes_query, repo_id=repo_id, limit=limit, offset=offset)
+            nodes = []
+            for record in nodes_result:
+                try:
+                    node_id = str(record["id"]) if record["id"] else f"node_{len(nodes)}"
+                    node_name = str(record["name"]) if record["name"] else node_id
+                    # For files, extract just the filename from the path
+                    if record["type"] == "File" and "/" in node_name:
+                        node_name = node_name.split("/")[-1]
+                    elif record["type"] == "File" and "\\\\" in node_name:
+                        node_name = node_name.split("\\\\")[-1]
+                    
+                    node = GraphNode(
+                        id=node_id,
+                        label=node_name,
+                        type=record["type"] or "Unknown",
+                        properties=normalize_neo4j_value(record["props"] or {})
+                    )
+                    nodes.append(node)
+                except Exception as e:
+                    logger.warning(f"Skipping invalid node: {e}")
+
+            # Get edges between File nodes with pagination
+            edges_query = \"\"\"
+            MATCH (a:File)-[r:IMPORTS|DEPENDS_ON]->(b:File)
+            WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) AND (b.repo_id = $repo_id OR b.job_id = $repo_id)
+            RETURN 
+                COALESCE(a.path, a.name, a.id, toString(id(a))) as source,
+                COALESCE(b.path, b.name, b.id, toString(id(b))) as target,
+                type(r) as type
+            SKIP $offset
+            LIMIT $limit
+            \"\"\"
+            edges_result = session.run(edges_query, repo_id=repo_id, limit=limit, offset=offset)
+            edges = []
+            for record in edges_result:
+                try:
+                    source = str(record["source"]) if record["source"] else None
+                    target = str(record["target"]) if record["target"] else None
+                    if source and target:
+                        edge = GraphEdge(
+                            source=source,
+                            target=target,
+                            type=record["type"] or "UNKNOWN"
+                        )
+                        edges.append(edge)
+                except Exception as e:
+                    logger.warning(f"Skipping invalid edge: {e}")
+
+            # Check if there are more results
+            has_more = (offset + limit) < max(total_nodes, total_edges)
+
+            return PaginatedGraphResponse(
+                nodes=nodes,
+                edges=edges,
+                total_nodes=total_nodes,
+                total_edges=total_edges,
+                limit=limit,
+                offset=offset,
+                has_more=has_more
+            )
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Graph retrieval error for files in {repo_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
 @app.post("/api/query")
 async def execute_cypher_query(query: str, params: Optional[Dict] = None):
     """
