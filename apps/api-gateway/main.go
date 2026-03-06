@@ -481,6 +481,13 @@ var (
 	db          *sql.DB
 	wsHub       *WebSocketHub
 	ctx         = context.Background()
+
+	// Circuit Breaker for Graph Engine
+	graphBreaker = &CircuitBreaker{
+		State:       Closed,
+		MaxFailures: 3,
+		Timeout:     30 * time.Second,
+	}
 )
 
 func main() {
@@ -749,6 +756,120 @@ func setupRouter() *gin.Engine {
 	router.POST("/api/export/:repo_id", exportRepository)
 
 	return router
+}
+
+// ============================================================================
+// Health Checks & Circuit Breakers
+// ============================================================================
+
+type BreakerState int
+
+const (
+	Closed BreakerState = iota
+	Open
+	HalfOpen
+)
+
+type CircuitBreaker struct {
+	State        BreakerState
+	FailureCount int
+	MaxFailures  int
+	Timeout      time.Duration
+	LastFailure  time.Time
+	mu           sync.Mutex
+}
+
+func (cb *CircuitBreaker) AllowRequest() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.State {
+	case Closed:
+		return true
+	case Open:
+		if time.Since(cb.LastFailure) > cb.Timeout {
+			cb.State = HalfOpen
+			return true
+		}
+		return false
+	case HalfOpen:
+		return true
+	}
+	return false
+}
+
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.FailureCount = 0
+	cb.State = Closed
+}
+
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.FailureCount++
+	cb.LastFailure = time.Now()
+
+	if cb.FailureCount >= cb.MaxFailures {
+		cb.State = Open
+		log.Printf("⚠️ Circuit Breaker OPENED due to %d consecutive failures", cb.FailureCount)
+	}
+}
+
+// healthCheck returns the aggregate status of all backend connections
+func healthCheck(c *gin.Context) {
+	status := "UP"
+	details := gin.H{}
+
+	// Check PostgreSQL
+	err := db.Ping()
+	if err != nil {
+		status = "DOWN"
+		details["postgres"] = "DOWN - " + err.Error()
+	} else {
+		details["postgres"] = "UP"
+	}
+
+	// Check Redis
+	err = redisClient.Ping(ctx).Err()
+	if err != nil {
+		status = "DOWN"
+		details["redis"] = "DOWN - " + err.Error()
+	} else {
+		details["redis"] = "UP"
+	}
+
+	// Check Graph Engine using Circuit Breaker logic
+	if !graphBreaker.AllowRequest() {
+		status = "DOWN"
+		details["graph_engine"] = "DOWN - Circuit Breaker Open"
+	} else {
+		graphEngineURL := getEnv("GRAPH_ENGINE_URL", "http://graph-engine:8000")
+		resp, err := http.Get(graphEngineURL + "/api/health")
+		if err != nil || resp.StatusCode != http.StatusOK {
+			graphBreaker.RecordFailure()
+			status = "DOWN"
+			details["graph_engine"] = "DOWN"
+			if err != nil {
+				details["graph_engine"] = "DOWN - " + err.Error()
+			}
+		} else {
+			graphBreaker.RecordSuccess()
+			details["graph_engine"] = "UP"
+		}
+	}
+
+	statusCode := http.StatusOK
+	if status != "UP" {
+		statusCode = http.StatusServiceUnavailable
+	}
+
+	c.JSON(statusCode, gin.H{
+		"status":  status,
+		"details": details,
+	})
 }
 
 // healthCheck returns the health status of the API Gateway
@@ -1056,6 +1177,13 @@ func analyzeImpact(c *gin.Context) {
 
 // getGraphFiles forwards the request to the graph engine to get the file dependency graph
 func getGraphFiles(c *gin.Context) {
+	if !graphBreaker.AllowRequest() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Graph engine unavailable (Circuit breaker open)",
+		})
+		return
+	}
+
 	repoID := c.Query("repo_id")
 	if repoID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -1080,6 +1208,7 @@ func getGraphFiles(c *gin.Context) {
 
 	resp, err := http.Get(requestURL)
 	if err != nil {
+		graphBreaker.RecordFailure()
 		log.Printf("Failed to reach graph engine for file dependency graph: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": "Graph engine unavailable",
@@ -1089,12 +1218,15 @@ func getGraphFiles(c *gin.Context) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		graphBreaker.RecordFailure()
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error":  "Graph engine returned an error",
 			"status": resp.StatusCode,
 		})
 		return
 	}
+
+	graphBreaker.RecordSuccess()
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -1109,6 +1241,13 @@ func getGraphFiles(c *gin.Context) {
 
 // getFunctionFlow forwards the request to the graph engine to get the function flow graph
 func getFunctionFlow(c *gin.Context) {
+	if !graphBreaker.AllowRequest() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Graph engine unavailable (Circuit breaker open)",
+		})
+		return
+	}
+
 	nodeID := c.Param("id")
 	if nodeID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -1129,6 +1268,7 @@ func getFunctionFlow(c *gin.Context) {
 
 	resp, err := http.Get(requestURL)
 	if err != nil {
+		graphBreaker.RecordFailure()
 		log.Printf("Failed to reach graph engine for function flow: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": "Graph engine unavailable",
@@ -1138,12 +1278,15 @@ func getFunctionFlow(c *gin.Context) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		graphBreaker.RecordFailure()
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error":  "Graph engine returned an error",
 			"status": resp.StatusCode,
 		})
 		return
 	}
+
+	graphBreaker.RecordSuccess()
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -1158,6 +1301,13 @@ func getFunctionFlow(c *gin.Context) {
 
 // detectCycles forwards the request to the graph engine to detect circular dependencies
 func detectCycles(c *gin.Context) {
+	if !graphBreaker.AllowRequest() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Graph engine unavailable (Circuit breaker open)",
+		})
+		return
+	}
+
 	repoID := c.Param("repo_id")
 	if !validateUUID(repoID) {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -1181,6 +1331,7 @@ func detectCycles(c *gin.Context) {
 	client := &http.Client{Timeout: 30 * time.Second} // Detection might take a while
 	resp, err := client.Do(req)
 	if err != nil {
+		graphBreaker.RecordFailure()
 		log.Printf("Failed to reach graph engine for cycle detection: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": "Graph engine unavailable",
@@ -1190,12 +1341,15 @@ func detectCycles(c *gin.Context) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		graphBreaker.RecordFailure()
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error":  "Graph engine returned an error",
 			"status": resp.StatusCode,
 		})
 		return
 	}
+
+	graphBreaker.RecordSuccess()
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {

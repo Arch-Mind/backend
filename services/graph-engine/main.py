@@ -10,6 +10,7 @@ import networkx as nx
 import logging
 import psycopg2
 from datetime import datetime, timedelta
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from llm_service import (
     LLMSettings,
@@ -47,6 +48,29 @@ neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 neo4j_user = os.getenv("NEO4J_USER", "neo4j")
 neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
 postgres_url = os.getenv("POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/archmind")
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint that verifies Neo4j connectivity."""
+    status = "UP"
+    details = {"graph_engine": "UP"}
+    
+    if neo4j_driver is None:
+        status = "DOWN"
+        details["neo4j"] = "DOWN - Driver not initialized"
+        raise HTTPException(status_code=503, detail={"status": status, "details": details})
+        
+    try:
+        # Verify connectivity
+        neo4j_driver.verify_connectivity()
+        details["neo4j"] = "UP"
+    except Exception as e:
+        logger.error(f"Health check failed to connect to Neo4j: {e}")
+        status = "DOWN"
+        details["neo4j"] = f"DOWN - {str(e)}"
+        raise HTTPException(status_code=503, detail={"status": status, "details": details})
+        
+    return {"status": status, "details": details}
 
 
 def connect_neo4j_with_retry(uri: str, user: str, password: str, max_retries: int = 4):
@@ -150,12 +174,15 @@ def validate_repo_id(repo_id: str) -> bool:
 async def check_repo_exists(session, repo_id: str) -> bool:
     """Check if repo_id or job_id exists in the database."""
     try:
-        # Check for both repo_id and job_id to support both identifiers
-        result = session.run(
-            "MATCH (n) WHERE n.repo_id = $repo_id OR n.job_id = $repo_id RETURN count(n) as count LIMIT 1",
-            repo_id=repo_id
-        )
-        record = result.single()
+        def check_repo_tx(tx):
+            # Check for both repo_id and job_id to support both identifiers
+            result = tx.run(
+                "MATCH (n) WHERE n.repo_id = $repo_id OR n.job_id = $repo_id RETURN count(n) as count LIMIT 1",
+                repo_id=repo_id
+            )
+            return result.single()
+
+        record = session.execute_read(check_repo_tx)
         return record and record["count"] > 0
     except Exception as e:
         logger.error(f"Error checking repo existence: {e}")
@@ -296,8 +323,11 @@ def store_insights(repo_id: str, insights: List[Dict]) -> None:
 async def get_total_count(session, query: str, repo_id: str) -> int:
     """Get total count for pagination."""
     try:
-        result = session.run(query, repo_id=repo_id)
-        record = result.single()
+        def count_tx(tx):
+            result = tx.run(query, repo_id=repo_id)
+            return result.single()
+            
+        record = session.execute_read(count_tx)
         return record["count"] if record else 0
     except Exception:
         return 0
@@ -699,7 +729,10 @@ async def get_dependency_graph(repo_id: str, limit: int = 100, offset: int = 0):
             SKIP $offset
             LIMIT $limit
             """
-            nodes_result = session.run(nodes_query, repo_id=repo_id, limit=limit, offset=offset)
+            def get_nodes_tx(tx):
+                return list(tx.run(nodes_query, repo_id=repo_id, limit=limit, offset=offset))
+                
+            nodes_result = session.execute_read(get_nodes_tx)
             nodes = []
             for record in nodes_result:
                 try:
@@ -732,7 +765,10 @@ async def get_dependency_graph(repo_id: str, limit: int = 100, offset: int = 0):
             SKIP $offset
             LIMIT $limit
             """
-            edges_result = session.run(edges_query, repo_id=repo_id, limit=limit, offset=offset)
+            def get_edges_tx(tx):
+                return list(tx.run(edges_query, repo_id=repo_id, limit=limit, offset=offset))
+                
+            edges_result = session.execute_read(get_edges_tx)
             edges = []
             for record in edges_result:
                 try:
@@ -817,7 +853,9 @@ async def get_file_dependency_graph(repo_id: str, limit: int = 100, offset: int 
             SKIP $offset
             LIMIT $limit
             \"\"\"
-            nodes_result = session.run(nodes_query, repo_id=repo_id, limit=limit, offset=offset)
+            def get_f_nodes_tx(tx):
+                return list(tx.run(nodes_query, repo_id=repo_id, limit=limit, offset=offset))
+            nodes_result = session.execute_read(get_f_nodes_tx)
             nodes = []
             for record in nodes_result:
                 try:
@@ -850,7 +888,9 @@ async def get_file_dependency_graph(repo_id: str, limit: int = 100, offset: int 
             SKIP $offset
             LIMIT $limit
             \"\"\"
-            edges_result = session.run(edges_query, repo_id=repo_id, limit=limit, offset=offset)
+            def get_f_edges_tx(tx):
+                return list(tx.run(edges_query, repo_id=repo_id, limit=limit, offset=offset))
+            edges_result = session.execute_read(get_f_edges_tx)
             edges = []
             for record in edges_result:
                 try:
@@ -915,7 +955,10 @@ async def get_function_flow(node_id: str, depth: int = 5):
             }}] as path_rels
             LIMIT 100
             """
-            result = session.run(query, node_id=node_id)
+            def get_flow_tx(tx):
+                return list(tx.run(query, node_id=node_id))
+                
+            result = session.execute_read(get_flow_tx)
             
             nodes_dict = {}
             edges_dict = {}
@@ -994,7 +1037,10 @@ async def detect_cycles(repo_id: str):
               AND (b.repo_id = $repo_id OR b.job_id = $repo_id)
             RETURN id(a) AS source_id, id(b) AS target_id, id(r) AS rel_id
             """
-            result = session.run(edges_query, repo_id=repo_id)
+            def get_cycles_edges_tx(tx):
+                return list(tx.run(edges_query, repo_id=repo_id))
+                
+            result = session.execute_read(get_cycles_edges_tx)
             
             # Step 2: Build NetworkX Directed Graph
             G = nx.DiGraph()

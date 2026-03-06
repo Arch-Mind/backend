@@ -153,35 +153,62 @@ pub async fn store_graph(
     config: Option<BatchConfig>,
 ) -> Result<()> {
     let config = config.unwrap_or_default();
-    info!("💾 Starting batch Neo4j storage (batch_size={})", config.batch_size);
+    let max_retries = 3;
+    let mut attempt = 0;
 
-    // Start a transaction
-    let mut txn = graph_db.start_txn().await.context("Failed to start transaction")?;
+    loop {
+        attempt += 1;
+        info!("💾 Starting batch Neo4j storage attempt {}/{} (batch_size={})", attempt, max_retries, config.batch_size);
 
-    // Execute batch operations with error handling
-    let result = execute_batch_operations(
-        &mut txn, 
-        job_id, 
-        repo_id, 
-        parsed_files, 
-        dep_graph, 
-        git_contributions,
-        boundary_result,
-        library_dependencies,
-        communication_analysis,
-        &config
-    ).await;
+        let mut txn = match graph_db.start_txn().await {
+            Ok(t) => t,
+            Err(e) => {
+                if attempt >= max_retries {
+                    return Err(anyhow::anyhow!("Failed to start transaction after {} attempts: {}", max_retries, e));
+                }
+                warn!("⚠️ Transaction start failed (attempt {}): {}. Retrying...", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+                continue;
+            }
+        };
 
-    match result {
-        Ok(_) => {
-            txn.commit().await.context("Failed to commit transaction")?;
-            info!("✅ Transaction committed successfully");
-            Ok(())
-        }
-        Err(e) => {
-            warn!("❌ Error during batch insert, rolling back: {}", e);
-            txn.rollback().await.context("Failed to rollback transaction")?;
-            Err(e)
+        let result = execute_batch_operations(
+            &mut txn, 
+            job_id, 
+            repo_id, 
+            parsed_files, 
+            dep_graph, 
+            git_contributions,
+            boundary_result,
+            library_dependencies,
+            communication_analysis,
+            &config
+        ).await;
+
+        match result {
+            Ok(_) => {
+                match txn.commit().await {
+                    Ok(_) => {
+                        info!("✅ Transaction committed successfully on attempt {}", attempt);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if attempt >= max_retries {
+                            return Err(anyhow::anyhow!("Failed to commit transaction after {} attempts: {}", max_retries, e));
+                        }
+                        warn!("⚠️ Transaction commit failed (attempt {}): {}. Retrying entire batch...", attempt, e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("❌ Error during batch insert on attempt {}, rolling back: {}", attempt, e);
+                let _ = txn.rollback().await;
+                if attempt >= max_retries {
+                    return Err(e);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+            }
         }
     }
 }
@@ -264,9 +291,8 @@ pub async fn store_graph_incremental(
     config: Option<BatchConfig>,
 ) -> Result<()> {
     let config = config.unwrap_or_default();
-    info!("💾 Starting incremental Neo4j storage (batch_size={})", config.batch_size);
-
-    let mut txn = graph_db.start_txn().await.context("Failed to start transaction")?;
+    let max_retries = 3;
+    let mut attempt = 0;
 
     let mut files_to_remove = Vec::new();
     files_to_remove.extend_from_slice(changed_files);
@@ -274,32 +300,70 @@ pub async fn store_graph_incremental(
     files_to_remove.sort();
     files_to_remove.dedup();
 
-    delete_file_nodes(&mut txn, repo_id, &files_to_remove).await?;
+    loop {
+        attempt += 1;
+        info!("💾 Starting incremental Neo4j storage attempt {}/{} (batch_size={})", attempt, max_retries, config.batch_size);
 
-    let result = execute_batch_operations(
-        &mut txn,
-        job_id,
-        repo_id,
-        parsed_files,
-        dep_graph,
-        git_contributions,
-        boundary_result,
-        library_dependencies,
-        communication_analysis,
-        &config,
-    )
-    .await;
+        let mut txn = match graph_db.start_txn().await {
+            Ok(t) => t,
+            Err(e) => {
+                if attempt >= max_retries {
+                    return Err(anyhow::anyhow!("Failed to start transaction after {} attempts: {}", max_retries, e));
+                }
+                warn!("⚠️ Transaction start failed (attempt {}): {}. Retrying...", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+                continue;
+            }
+        };
 
-    match result {
-        Ok(_) => {
-            txn.commit().await.context("Failed to commit transaction")?;
-            info!("✅ Incremental transaction committed successfully");
-            Ok(())
+        if let Err(e) = delete_file_nodes(&mut txn, repo_id, &files_to_remove).await {
+            let _ = txn.rollback().await;
+            if attempt >= max_retries {
+                return Err(e);
+            }
+            warn!("⚠️ Error deleting file nodes (attempt {}): {}. Retrying...", attempt, e);
+            tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+            continue;
         }
-        Err(e) => {
-            warn!("❌ Error during incremental insert, rolling back: {}", e);
-            txn.rollback().await.context("Failed to rollback transaction")?;
-            Err(e)
+
+        let result = execute_batch_operations(
+            &mut txn,
+            job_id,
+            repo_id,
+            parsed_files,
+            dep_graph,
+            git_contributions,
+            boundary_result,
+            library_dependencies,
+            communication_analysis,
+            &config,
+        )
+        .await;
+
+        match result {
+            Ok(_) => {
+                match txn.commit().await {
+                    Ok(_) => {
+                        info!("✅ Incremental transaction committed successfully on attempt {}", attempt);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if attempt >= max_retries {
+                            return Err(anyhow::anyhow!("Failed to commit transaction after {} attempts: {}", max_retries, e));
+                        }
+                        warn!("⚠️ Transaction commit failed (attempt {}): {}. Retrying entire batch...", attempt, e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("❌ Error during incremental insert on attempt {}, rolling back: {}", attempt, e);
+                let _ = txn.rollback().await;
+                if attempt >= max_retries {
+                    return Err(e);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+            }
         }
     }
 }
