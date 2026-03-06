@@ -740,6 +740,9 @@ func setupRouter() *gin.Engine {
 	// Alias exact path for Reverse Analysis Impact
 	router.GET("/api/analyze/impact", analyzeImpact)
 
+	// Graph endpoints
+	router.GET("/api/graph/files", getGraphFiles)
+
 	// Export endpoint
 	router.POST("/api/export/:repo_id", exportRepository)
 
@@ -1023,6 +1026,59 @@ func analyzeImpact(c *gin.Context) {
 	resp, err := http.Get(requestURL)
 	if err != nil {
 		log.Printf("Failed to reach graph engine for reverse impact analysis: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "Graph engine unavailable",
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":  "Graph engine returned an error",
+			"status": resp.StatusCode,
+		})
+		return
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to decode graph engine response",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// getGraphFiles forwards the request to the graph engine to get the file dependency graph
+func getGraphFiles(c *gin.Context) {
+	repoID := c.Query("repo_id")
+	if repoID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Missing repo_id query parameter",
+		})
+		return
+	}
+
+	limit := c.Query("limit")
+	offset := c.Query("offset")
+
+	graphEngineURL := getEnv("GRAPH_ENGINE_URL", "http://graph-engine:8000")
+	// Prepare connection to graph engine
+	requestURL := fmt.Sprintf("%s/api/graph/files?repo_id=%s", graphEngineURL, url.QueryEscape(repoID))
+	
+	if limit != "" {
+		requestURL += fmt.Sprintf("&limit=%s", url.QueryEscape(limit))
+	}
+	if offset != "" {
+		requestURL += fmt.Sprintf("&offset=%s", url.QueryEscape(offset))
+	}
+
+	resp, err := http.Get(requestURL)
+	if err != nil {
+		log.Printf("Failed to reach graph engine for file dependency graph: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": "Graph engine unavailable",
 		})
