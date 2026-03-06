@@ -886,6 +886,80 @@ async def get_file_dependency_graph(repo_id: str, limit: int = 100, offset: int 
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@app.get("/api/graph/functions/{node_id}/flow")
+async def get_function_flow(node_id: str, depth: int = 5):
+    """
+    Retrieve the execution flow (CALLS graph) for a specific function.
+    Returns connected functions up to a certain depth.
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+
+    depth = max(1, min(depth, 10))  # Clamp between 1 and 10
+
+    try:
+        with neo4j_driver.session() as session:
+            query = f"""
+            MATCH path = (start:Function)-[:CALLS*0..{depth}]-(connected:Function)
+            WHERE start.id = $node_id OR start.name = $node_id OR toString(id(start)) = $node_id
+            RETURN [n in nodes(path) | {{
+                id: COALESCE(n.id, n.path, n.name, toString(id(n))), 
+                name: COALESCE(n.name, n.path, toString(id(n))), 
+                type: labels(n)[0], 
+                props: properties(n)
+            }}] as path_nodes,
+                   [r in relationships(path) | {{
+                source: COALESCE(startNode(r).id, startNode(r).path, startNode(r).name, toString(id(startNode(r)))), 
+                target: COALESCE(endNode(r).id, endNode(r).path, endNode(r).name, toString(id(endNode(r)))), 
+                type: type(r)
+            }}] as path_rels
+            LIMIT 100
+            """
+            result = session.run(query, node_id=node_id)
+            
+            nodes_dict = {}
+            edges_dict = {}
+            
+            for record in result:
+                for n in record["path_nodes"]:
+                    n_id = n["id"]
+                    if n_id not in nodes_dict:
+                        nodes_dict[n_id] = GraphNode(
+                            id=n_id,
+                            label=n["name"] or n_id,
+                            type=n["type"] or "Unknown",
+                            properties=normalize_neo4j_value(n["props"] or {})
+                        )
+                
+                for r in record["path_rels"]:
+                    edge_key = f"{{r['source']}}-{{r['type']}}-{{r['target']}}"
+                    if edge_key not in edges_dict:
+                        edges_dict[edge_key] = GraphEdge(
+                            source=r["source"],
+                            target=r["target"],
+                            type=r["type"]
+                        )
+            
+            if not nodes_dict:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Function not found: {node_id}"
+                )
+            
+            return GraphResponse(
+                nodes=list(nodes_dict.values()),
+                edges=list(edges_dict.values()),
+                total_nodes=len(nodes_dict),
+                total_edges=len(edges_dict)
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Function flow retrieval error for {node_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
 @app.post("/api/query")
 async def execute_cypher_query(query: str, params: Optional[Dict] = None):
     """

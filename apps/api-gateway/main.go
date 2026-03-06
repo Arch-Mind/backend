@@ -742,6 +742,7 @@ func setupRouter() *gin.Engine {
 
 	// Graph endpoints
 	router.GET("/api/graph/files", getGraphFiles)
+	router.GET("/api/graph/functions/:id/flow", getFunctionFlow)
 
 	// Export endpoint
 	router.POST("/api/export/:repo_id", exportRepository)
@@ -1079,6 +1080,55 @@ func getGraphFiles(c *gin.Context) {
 	resp, err := http.Get(requestURL)
 	if err != nil {
 		log.Printf("Failed to reach graph engine for file dependency graph: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "Graph engine unavailable",
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":  "Graph engine returned an error",
+			"status": resp.StatusCode,
+		})
+		return
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to decode graph engine response",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// getFunctionFlow forwards the request to the graph engine to get the function flow graph
+func getFunctionFlow(c *gin.Context) {
+	nodeID := c.Param("id")
+	if nodeID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Missing id parameter",
+		})
+		return
+	}
+
+	depth := c.Query("depth")
+
+	graphEngineURL := getEnv("GRAPH_ENGINE_URL", "http://graph-engine:8000")
+	// Prepare connection to graph engine
+	requestURL := fmt.Sprintf("%s/api/graph/functions/%s/flow", graphEngineURL, url.PathEscape(nodeID))
+	
+	if depth != "" {
+		requestURL += fmt.Sprintf("?depth=%s", url.QueryEscape(depth))
+	}
+
+	resp, err := http.Get(requestURL)
+	if err != nil {
+		log.Printf("Failed to reach graph engine for function flow: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": "Graph engine unavailable",
 		})
