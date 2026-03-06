@@ -127,6 +127,24 @@ def test_graph_endpoint_repo_not_found(mock_driver):
 
 
 @patch('main.neo4j_driver')
+def test_graph_files_endpoint_repo_not_found(mock_driver):
+    """Test graph files endpoint returns 404 when repo doesn't exist."""
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    
+    # Mock check_repo_exists to return False
+    mock_result = MagicMock()
+    mock_result.single.return_value = {"count": 0}
+    mock_session.run.return_value = mock_result
+    
+    valid_uuid = "550e8400-e29b-41d4-a716-446655440000"
+    response = client.get(f"/api/graph/files?repo_id={valid_uuid}")
+    
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+@patch('main.neo4j_driver')
 def test_metrics_endpoint_empty_data(mock_driver):
     """Test metrics endpoint handles empty dataset gracefully."""
     mock_session = MagicMock()
@@ -325,6 +343,15 @@ def test_graph_endpoint_invalid_repo_id():
     """Test graph endpoint rejects invalid repo_id."""
     invalid_id = "12345"
     response = client.get(f"/api/graph/{invalid_id}")
+    
+    assert response.status_code == 400
+    assert "Invalid repo_id format" in response.json()["detail"]
+
+
+def test_graph_files_endpoint_invalid_repo_id():
+    """Test graph files endpoint rejects invalid repo_id."""
+    invalid_id = "12345"
+    response = client.get(f"/api/graph/files?repo_id={invalid_id}")
     
     assert response.status_code == 400
     assert "Invalid repo_id format" in response.json()["detail"]
