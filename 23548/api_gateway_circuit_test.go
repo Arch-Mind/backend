@@ -1,9 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -64,4 +69,70 @@ func TestCircuitBreaker_StateTransitions(t *testing.T) {
 	// Record failure drops it back to Open
 	cb.RecordFailure()
 	assert.Equal(t, Open, cb.State, "Should return to Open if HalfOpen request fails")
+}
+
+func setupRouterForErrorHandling() *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	router := gin.Default()
+	router.GET("/health", healthCheck)
+	router.GET("/api/graph/files", getGraphFiles)
+	return router
+}
+
+func TestHealthCheckAndCircuitBreaker(t *testing.T) {
+	router := setupRouterForErrorHandling()
+
+	t.Run("Health Check - Upstream Healthy", func(t *testing.T) {
+		mockGraphEngine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer mockGraphEngine.Close()
+
+		os.Setenv("GRAPH_ENGINE_URL", mockGraphEngine.URL)
+
+		// Set State to Closed
+		graphBreaker.State = Closed
+		graphBreaker.FailureCount = 0
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/health", nil)
+		router.ServeHTTP(w, req)
+
+		var response map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &response)
+		
+		details := response["details"].(map[string]interface{})
+		assert.Equal(t, "UP", details["graph_engine"])
+	})
+
+	t.Run("Circuit Breaker - Trips on Consecutive Failures", func(t *testing.T) {
+		mockGraphEngine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer mockGraphEngine.Close()
+
+		os.Setenv("GRAPH_ENGINE_URL", mockGraphEngine.URL)
+        
+        // Reset state
+        graphBreaker.State = Closed
+        graphBreaker.FailureCount = 0
+
+		// Fail 3 times, which is our MaxFailures default
+		for i := 0; i < 3; i++ {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "/api/graph/files?repo_id=test", nil)
+			router.ServeHTTP(w, req)
+			assert.Equal(t, http.StatusBadGateway, w.Code)
+		}
+
+		// 4th time should be 503 Circuit Breaker Open immediately
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/graph/files?repo_id=test", nil)
+		router.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+		var response map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &response)
+		assert.Contains(t, response["error"], "Circuit breaker open")
+	})
 }

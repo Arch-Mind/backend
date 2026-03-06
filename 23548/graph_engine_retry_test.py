@@ -298,5 +298,32 @@ def test_retry_logging(mock_sleep, mock_driver, mock_logger):
     assert mock_logger.error.call_count == 1  # Final failure
 
 
+def test_execute_read_used_for_transactions():
+    """Verify that execute_read is used instead of session.run for safe retries."""
+    from main import app
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    
+    with patch('main.neo4j_driver') as mock_driver:
+        mock_session = MagicMock()
+        mock_driver.session.return_value.__enter__.return_value = mock_session
+        
+        # Mock repo existence check
+        mock_result1 = MagicMock()
+        mock_result1.single.return_value = {"exists": True}
+        
+        # Mock total count checks
+        mock_result2 = MagicMock()
+        mock_result2.single.return_value = {"count": 1}
+        
+        mock_session.run.side_effect = [mock_result1, mock_result2, mock_result2]
+        
+        # Mock the execute_read returning empty list to avoid parsing errors
+        mock_session.execute_read.return_value = []
+        
+        response = client.get("/api/graph/files?repo_id=550e8400-e29b-41d4-a716-446655440000")
+        
+        assert mock_session.execute_read.called, "Endpoint must use execute_read for automatic transaction retries"
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

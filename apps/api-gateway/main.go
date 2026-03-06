@@ -872,29 +872,6 @@ func healthCheck(c *gin.Context) {
 	})
 }
 
-// healthCheck returns the health status of the API Gateway
-func healthCheck(c *gin.Context) {
-	// Check Redis
-	redisStatus := "healthy"
-	if err := redisClient.Ping(ctx).Err(); err != nil {
-		redisStatus = "unhealthy"
-	}
-
-	// Check PostgreSQL
-	dbStatus := "healthy"
-	if err := db.Ping(); err != nil {
-		dbStatus = "unhealthy"
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"status": "ok",
-		"services": gin.H{
-			"redis":    redisStatus,
-			"postgres": dbStatus,
-		},
-		"timestamp": time.Now().UTC(),
-	})
-}
 
 // handleJobWebSocket handles WebSocket connections for job-specific updates
 func handleJobWebSocket(c *gin.Context) {
