@@ -390,7 +390,72 @@ def test_function_flow_endpoint_db_error(mock_driver):
 
 
 # ================================
-# Test 7: Invalid Input Validation
+# Test 7: Circular Dependency Detection Endpoint
+# ================================
+
+@patch('main.neo4j_driver')
+def test_detect_cycles_endpoint_success(mock_driver):
+    """Test detect-cycles endpoint successfully processes graph and flags cycles."""
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    
+    # 1. Mock repo exists
+    mock_exists = MagicMock()
+    mock_exists.single.return_value = {"count": 1}
+    
+    # 2. Mock edges fetch: create a cycle 1 -> 2 -> 3 -> 1
+    mock_edges = MagicMock()
+    mock_edges.__iter__ = Mock(return_value=iter([
+        {"source_id": 1, "target_id": 2, "rel_id": 101},
+        {"source_id": 2, "target_id": 3, "rel_id": 102},
+        {"source_id": 3, "target_id": 1, "rel_id": 103},
+        {"source_id": 1, "target_id": 4, "rel_id": 104}  # Outward edge, not in cycle
+    ]))
+    
+    # 3. Mock node flagging
+    mock_node_flag = MagicMock()
+    mock_node_flag.single.return_value = {"updated": 3}
+    
+    # 4. Mock edge flagging
+    mock_edge_flag = MagicMock()
+    mock_edge_flag.single.return_value = {"updated": 3}
+    
+    mock_session.run.side_effect = [
+        mock_exists,
+        mock_edges,
+        mock_node_flag,
+        mock_edge_flag
+    ]
+    
+    valid_uuid = "function-12345678-uuid"
+    response = client.post(f"/api/graph/{valid_uuid}/detect-cycles")
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert data["message"] == "Cycle detection completed successfully"
+    assert data["total_cycles_found"] == 1
+    assert data["nodes_flagged"] == 3
+    assert data["edges_flagged"] == 3
+
+
+@patch('main.neo4j_driver')
+def test_detect_cycles_endpoint_repo_not_found(mock_driver):
+    """Test detect-cycles returns 404 for missing repository."""
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    
+    mock_exists = MagicMock()
+    mock_exists.single.return_value = {"count": 0}
+    mock_session.run.return_value = mock_exists
+    
+    response = client.post("/api/graph/valid-12345678-uuid/detect-cycles")
+    
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+# ================================
+# Test 8: Invalid Input Validation
 # ================================
 
 def test_metrics_endpoint_invalid_repo_id():

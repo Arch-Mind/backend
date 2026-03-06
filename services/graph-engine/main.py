@@ -960,6 +960,116 @@ async def get_function_flow(node_id: str, depth: int = 5):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@app.post("/api/graph/{repo_id}/detect-cycles")
+async def detect_cycles(repo_id: str):
+    """
+    Detect circular dependencies (cycles) in the repository's dependency graph.
+    Flags affected nodes and edges with `is_circular: true` in Neo4j.
+    repo_id is the job_id from the analysis job.
+    """
+    if not neo4j_driver:
+        raise HTTPException(status_code=503, detail="Neo4j connection not available")
+
+    # Validate repo_id format
+    if not validate_repo_id(repo_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid repo_id format. Expected UUID, got: {repo_id}"
+        )
+
+    try:
+        with neo4j_driver.session() as session:
+            # Check if repo exists
+            repo_exists = await check_repo_exists(session, repo_id)
+            if not repo_exists:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Repository not found: {repo_id}. Please ensure the analysis job has completed successfully."
+                )
+
+            # Step 1: Fetch all dependency edges for the repo
+            edges_query = """
+            MATCH (a)-[r:IMPORTS|CALLS|DEPENDS_ON|USES_TABLE|CALLS_SERVICE|INHERITS]->(b)
+            WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) 
+              AND (b.repo_id = $repo_id OR b.job_id = $repo_id)
+            RETURN id(a) AS source_id, id(b) AS target_id, id(r) AS rel_id
+            """
+            result = session.run(edges_query, repo_id=repo_id)
+            
+            # Step 2: Build NetworkX Directed Graph
+            G = nx.DiGraph()
+            edge_map = {}  # Map (source_id, target_id) to list of Neo4j relationship native IDs
+            
+            for record in result:
+                src = record["source_id"]
+                tgt = record["target_id"]
+                rel = record["rel_id"]
+                
+                G.add_edge(src, tgt)
+                if (src, tgt) not in edge_map:
+                    edge_map[(src, tgt)] = []
+                edge_map[(src, tgt)].append(rel)
+
+            # Step 3: Find simple cycles using NetworkX
+            # simple_cycles returns lists of nodes that form a cycle: [n1, n2, n3] means n1->n2->n3->n1
+            cycles = list(nx.simple_cycles(G))
+            
+            cyclic_nodes = set()
+            cyclic_edges = set()
+            
+            for cycle in cycles:
+                # Add all nodes in the cycle
+                cyclic_nodes.update(cycle)
+                
+                # Add all edges that make up the cycle
+                # A cycle of length N has N edges: (cycle[0], cycle[1]), ..., (cycle[N-1], cycle[0])
+                for i in range(len(cycle)):
+                    src = cycle[i]
+                    tgt = cycle[(i + 1) % len(cycle)]
+                    
+                    # Add all relationship IDs matching this source/target pair
+                    if (src, tgt) in edge_map:
+                        cyclic_edges.update(edge_map[(src, tgt)])
+            
+            # Step 4: Flag cyclic elements in Neo4j
+            nodes_updated = 0
+            edges_updated = 0
+            
+            if cyclic_nodes:
+                node_update_query = """
+                UNWIND $node_ids AS node_id
+                MATCH (n) WHERE id(n) = node_id
+                SET n.is_circular = true
+                RETURN count(n) AS updated
+                """
+                node_res = session.run(node_update_query, node_ids=list(cyclic_nodes)).single()
+                nodes_updated = node_res["updated"] if node_res else 0
+                
+            if cyclic_edges:
+                edge_update_query = """
+                UNWIND $rel_ids AS rel_id
+                MATCH ()-[r]->() WHERE id(r) = rel_id
+                SET r.is_circular = true
+                RETURN count(r) AS updated
+                """
+                edge_res = session.run(edge_update_query, rel_ids=list(cyclic_edges)).single()
+                edges_updated = edge_res["updated"] if edge_res else 0
+
+            return {
+                "message": "Cycle detection completed successfully",
+                "total_cycles_found": len(cycles),
+                "nodes_flagged": nodes_updated,
+                "edges_flagged": edges_updated
+            }
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Cycle detection error for {repo_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
 @app.post("/api/query")
 async def execute_cypher_query(query: str, params: Optional[Dict] = None):
     """

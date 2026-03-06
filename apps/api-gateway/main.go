@@ -743,6 +743,7 @@ func setupRouter() *gin.Engine {
 	// Graph endpoints
 	router.GET("/api/graph/files", getGraphFiles)
 	router.GET("/api/graph/functions/:id/flow", getFunctionFlow)
+	router.POST("/api/graph/:repo_id/detect-cycles", detectCycles)
 
 	// Export endpoint
 	router.POST("/api/export/:repo_id", exportRepository)
@@ -1129,6 +1130,58 @@ func getFunctionFlow(c *gin.Context) {
 	resp, err := http.Get(requestURL)
 	if err != nil {
 		log.Printf("Failed to reach graph engine for function flow: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "Graph engine unavailable",
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":  "Graph engine returned an error",
+			"status": resp.StatusCode,
+		})
+		return
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to decode graph engine response",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// detectCycles forwards the request to the graph engine to detect circular dependencies
+func detectCycles(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	if !validateUUID(repoID) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid repo_id format",
+		})
+		return
+	}
+
+	graphEngineURL := getEnv("GRAPH_ENGINE_URL", "http://graph-engine:8000")
+	requestURL := fmt.Sprintf("%s/api/graph/%s/detect-cycles", graphEngineURL, url.PathEscape(repoID))
+
+	// Create a POST request
+	req, err := http.NewRequest("POST", requestURL, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to create request",
+		})
+		return
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second} // Detection might take a while
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to reach graph engine for cycle detection: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error": "Graph engine unavailable",
 		})
