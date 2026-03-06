@@ -327,7 +327,70 @@ def test_create_indexes_endpoint(mock_driver):
 
 
 # ================================
-# Test 6: Invalid Input Validation
+# Test 6: Function Call Flow Endpoint
+# ================================
+
+@patch('main.neo4j_driver')
+def test_function_flow_endpoint_success(mock_driver):
+    """Test graph function flow endpoint returns valid paths."""
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    
+    # Mock node and relationship data
+    mock_result = MagicMock()
+    mock_result.__iter__ = Mock(return_value=iter([
+        {
+            "path_nodes": [{"id": "func1", "name": "main", "type": "Function", "props": {}}],
+            "path_rels": [{"source": "func1", "target": "func2", "type": "CALLS"}]
+        }
+    ]))
+    mock_session.run.return_value = mock_result
+    
+    func_uuid = "function-12345678-uuid"
+    response = client.get(f"/api/graph/functions/{func_uuid}/flow?depth=5")
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert "nodes" in data
+    assert "edges" in data
+    assert len(data["nodes"]) == 1
+    assert len(data["edges"]) == 1
+
+
+@patch('main.neo4j_driver')
+def test_function_flow_endpoint_not_found(mock_driver):
+    """Test function flow returns 404 for missing node."""
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    
+    # Mock empty path result
+    mock_result = MagicMock()
+    mock_result.__iter__ = Mock(return_value=iter([]))
+    mock_session.run.return_value = mock_result
+    
+    func_uuid = "missing-func-uuid"
+    response = client.get(f"/api/graph/functions/{func_uuid}/flow")
+    
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+@patch('main.neo4j_driver')
+def test_function_flow_endpoint_db_error(mock_driver):
+    """Test function flow endpoint handles DB errors properly."""
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    
+    mock_session.run.side_effect = Exception("Database failure")
+    
+    response = client.get("/api/graph/functions/func-uuid/flow")
+    
+    assert response.status_code == 500
+    assert "internal server error" in response.json()["detail"].lower()
+
+
+# ================================
+# Test 7: Invalid Input Validation
 # ================================
 
 def test_metrics_endpoint_invalid_repo_id():
