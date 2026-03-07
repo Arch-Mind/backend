@@ -249,51 +249,51 @@ async fn execute_batch_operations(
     };
 
     // 1. Create Job node
-    create_job_node(txn, job_id, repo_id).await?;
+    create_job_node(graph_db, job_id, repo_id).await?;
 
     // 2. Batch insert nodes
-    batch_insert_file_nodes(txn, job_id, repo_id, parsed_files, git_contributions, config.batch_size).await?;
-    batch_insert_class_nodes(txn, job_id, repo_id, parsed_files, config.batch_size).await?;
-    batch_insert_function_nodes(txn, job_id, repo_id, parsed_files, config.batch_size).await?;
-    batch_insert_module_nodes(txn, job_id, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_file_nodes(graph_db, job_id, repo_id, parsed_files, git_contributions, config.batch_size).await?;
+    batch_insert_class_nodes(graph_db, job_id, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_function_nodes(graph_db, job_id, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_module_nodes(graph_db, job_id, repo_id, dep_graph, config.batch_size).await?;
     
     // 3. Batch insert boundaries
-    batch_insert_boundary_nodes(txn, job_id, repo_id, boundary_result, config.batch_size).await?;
+    batch_insert_boundary_nodes(graph_db, job_id, repo_id, boundary_result, config.batch_size).await?;
 
     // 3b. Batch insert library nodes
-    batch_insert_library_nodes(txn, job_id, repo_id, library_dependencies, config.batch_size).await?;
+    batch_insert_library_nodes(graph_db, job_id, repo_id, library_dependencies, config.batch_size).await?;
 
     // 4. Batch insert edges
-    batch_insert_defines_edges(txn, repo_id, dep_graph, config.batch_size).await?;
-    batch_insert_contains_edges(txn, repo_id, dep_graph, config.batch_size).await?;
-    batch_insert_calls_edges(txn, repo_id, dep_graph, config.batch_size).await?;
-    batch_insert_imports_edges(txn, repo_id, dep_graph, config.batch_size).await?;
-    batch_insert_inherits_edges(txn, repo_id, dep_graph, config.batch_size).await?;
-    batch_insert_belongs_to_edges(txn, repo_id, boundary_result, config.batch_size).await?;
+    batch_insert_defines_edges(graph_db, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_contains_edges(graph_db, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_calls_edges(graph_db, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_imports_edges(graph_db, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_inherits_edges(graph_db, repo_id, dep_graph, config.batch_size).await?;
+    batch_insert_belongs_to_edges(graph_db, repo_id, boundary_result, config.batch_size).await?;
 
     // 4b. Batch insert library edges
-    batch_insert_library_edges(txn, repo_id, parsed_files, library_dependencies, config.batch_size).await?;
+    batch_insert_library_edges(graph_db, repo_id, parsed_files, library_dependencies, config.batch_size).await?;
 
     // 4c. Batch insert data dependency edges (tables)
-    batch_insert_table_nodes(txn, repo_id, parsed_files, config.batch_size).await?;
-    batch_insert_table_edges(txn, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_table_nodes(graph_db, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_table_edges(graph_db, repo_id, parsed_files, config.batch_size).await?;
 
     // 4d. Batch insert service communication edges
-    batch_insert_service_nodes(txn, repo_id, parsed_files, config.batch_size).await?;
-    batch_insert_service_edges(txn, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_service_nodes(graph_db, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_service_edges(graph_db, repo_id, parsed_files, config.batch_size).await?;
 
     // 4e. Batch insert communication nodes and edges
-    batch_insert_endpoint_nodes(txn, repo_id, communication_analysis, config.batch_size).await?;
-    batch_insert_endpoint_edges(txn, repo_id, communication_analysis, config.batch_size).await?;
-    batch_insert_rpc_nodes(txn, repo_id, communication_analysis, config.batch_size).await?;
-    batch_insert_rpc_edges(txn, repo_id, communication_analysis, config.batch_size).await?;
-    batch_insert_queue_nodes(txn, repo_id, communication_analysis, config.batch_size).await?;
-    batch_insert_queue_edges(txn, repo_id, communication_analysis, config.batch_size).await?;
-    batch_insert_compose_service_nodes(txn, repo_id, communication_analysis, config.batch_size).await?;
-    batch_insert_endpoint_service_edges(txn, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_endpoint_nodes(graph_db, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_endpoint_edges(graph_db, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_rpc_nodes(graph_db, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_rpc_edges(graph_db, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_queue_nodes(graph_db, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_queue_edges(graph_db, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_compose_service_nodes(graph_db, repo_id, communication_analysis, config.batch_size).await?;
+    batch_insert_endpoint_service_edges(graph_db, repo_id, communication_analysis, config.batch_size).await?;
     
     // 5. Create file-to-file dependency edges based on imports
-    batch_insert_file_dependencies(txn, repo_id, parsed_files, config.batch_size).await?;
+    batch_insert_file_dependencies(graph_db, repo_id, parsed_files, config.batch_size).await?;
 
     Ok(())
 }
