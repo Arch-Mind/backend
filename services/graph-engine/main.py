@@ -842,7 +842,7 @@ async def get_file_dependency_graph(repo_id: str, limit: int = 100, offset: int 
             total_edges = await get_total_count(session, total_edges_query, repo_id)
 
             # Get File nodes with pagination
-            nodes_query = \"\"\"
+            nodes_query = """
             MATCH (n:File)
             WHERE n.repo_id = $repo_id OR n.job_id = $repo_id
             RETURN 
@@ -852,7 +852,7 @@ async def get_file_dependency_graph(repo_id: str, limit: int = 100, offset: int 
                 properties(n) as props
             SKIP $offset
             LIMIT $limit
-            \"\"\"
+            """
             def get_f_nodes_tx(tx):
                 return list(tx.run(nodes_query, repo_id=repo_id, limit=limit, offset=offset))
             nodes_result = session.execute_read(get_f_nodes_tx)
@@ -878,7 +878,7 @@ async def get_file_dependency_graph(repo_id: str, limit: int = 100, offset: int 
                     logger.warning(f"Skipping invalid node: {e}")
 
             # Get edges between File nodes with pagination
-            edges_query = \"\"\"
+            edges_query = """
             MATCH (a:File)-[r:IMPORTS|DEPENDS_ON]->(b:File)
             WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) AND (b.repo_id = $repo_id OR b.job_id = $repo_id)
             RETURN 
@@ -887,7 +887,7 @@ async def get_file_dependency_graph(repo_id: str, limit: int = 100, offset: int 
                 type(r) as type
             SKIP $offset
             LIMIT $limit
-            \"\"\"
+            """
             def get_f_edges_tx(tx):
                 return list(tx.run(edges_query, repo_id=repo_id, limit=limit, offset=offset))
             edges_result = session.execute_read(get_f_edges_tx)
