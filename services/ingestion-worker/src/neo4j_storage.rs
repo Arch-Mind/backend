@@ -15,13 +15,13 @@ use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
 macro_rules! retry_query {
-    (, ) => {{
+    ($graph_db:expr, { $($body:tt)* }) => {{
         let max_retries = 3;
         let mut attempt = 0;
         let mut last_err = anyhow::anyhow!("Unknown error");
         loop {
             attempt += 1;
-            let mut txn = match .start_txn().await {
+            let mut txn = match $graph_db.start_txn().await {
                 Ok(t) => t,
                 Err(e) => {
                     if attempt >= max_retries {
@@ -33,7 +33,7 @@ macro_rules! retry_query {
                 }
             };
             
-            match txn.run().await {
+            match txn.run($($body)*).await {
                 Ok(_) => {
                     match txn.commit().await {
                         Ok(_) => break Ok(()),
