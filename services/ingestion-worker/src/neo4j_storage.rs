@@ -18,29 +18,26 @@ macro_rules! retry_query {
     ($graph_db:expr, { $($body:tt)* }) => {{
         let max_retries = 3;
         let mut attempt = 0;
-        let mut last_err = anyhow::anyhow!("Unknown error");
-        loop {
+        let result: Result<(), anyhow::Error> = loop {
             attempt += 1;
             let mut txn = match $graph_db.start_txn().await {
                 Ok(t) => t,
                 Err(e) => {
                     if attempt >= max_retries {
-                        last_err = e.into();
-                        break;
+                        break Err(e.into());
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
                     continue;
                 }
             };
-            
+
             match txn.run($($body)*).await {
                 Ok(_) => {
                     match txn.commit().await {
                         Ok(_) => break Ok(()),
                         Err(e) => {
                             if attempt >= max_retries {
-                                last_err = e.into();
-                                break;
+                                break Err(e.into());
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
                         }
@@ -49,18 +46,13 @@ macro_rules! retry_query {
                 Err(e) => {
                     let _ = txn.rollback().await;
                     if attempt >= max_retries {
-                        last_err = e.into();
-                        break;
+                        break Err(e.into());
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
                 }
             }
-        }
-        if attempt >= max_retries {
-            Err(last_err)
-        } else {
-            Ok(())
-        }
+        };
+        result
     }};
 }
 
