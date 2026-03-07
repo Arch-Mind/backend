@@ -14,6 +14,57 @@ use neo4rs::query;
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
+macro_rules! retry_query {
+    (, ) => {{
+        let max_retries = 3;
+        let mut attempt = 0;
+        let mut last_err = anyhow::anyhow!("Unknown error");
+        loop {
+            attempt += 1;
+            let mut txn = match .start_txn().await {
+                Ok(t) => t,
+                Err(e) => {
+                    if attempt >= max_retries {
+                        last_err = e.into();
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+                    continue;
+                }
+            };
+            
+            match txn.run().await {
+                Ok(_) => {
+                    match txn.commit().await {
+                        Ok(_) => break Ok(()),
+                        Err(e) => {
+                            if attempt >= max_retries {
+                                last_err = e.into();
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = txn.rollback().await;
+                    if attempt >= max_retries {
+                        last_err = e.into();
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
+                }
+            }
+        }
+        if attempt >= max_retries {
+            Err(last_err)
+        } else {
+            Ok(())
+        }
+    }};
+}
+
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -89,45 +140,54 @@ fn module_node_to_map(name: &str, job_id: &str, repo_id: &str) -> BoltMap {
     m
 }
 
-async fn delete_file_nodes(txn: &mut neo4rs::Txn, repo_id: &str, files: &[String]) -> Result<()> {
+async fn delete_file_nodes(graph_db: &neo4rs::Graph, repo_id: &str, files: &[String]) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
 
-    let remove_files = query(
+    retry_query!(graph_db, {
+
+
+        query(
         "UNWIND $paths AS path
          MATCH (f:File {path: path, repo_id: $repo_id})
          DETACH DELETE f"
     )
     .param("paths", files.to_vec())
-    .param("repo_id", repo_id);
+    .param("repo_id", repo_id)
 
-    txn.run(remove_files)
-        .await
+
+    })
         .context("Failed to delete file nodes")?;
 
-    let remove_classes = query(
+    retry_query!(graph_db, {
+
+
+        query(
         "UNWIND $paths AS path
          MATCH (c:Class {file: path, repo_id: $repo_id})
          DETACH DELETE c"
     )
     .param("paths", files.to_vec())
-    .param("repo_id", repo_id);
+    .param("repo_id", repo_id)
 
-    txn.run(remove_classes)
-        .await
+
+    })
         .context("Failed to delete class nodes")?;
 
-    let remove_functions = query(
+    retry_query!(graph_db, {
+
+
+        query(
         "UNWIND $paths AS path
          MATCH (fn:Function {file: path, repo_id: $repo_id})
          DETACH DELETE fn"
     )
     .param("paths", files.to_vec())
-    .param("repo_id", repo_id);
+    .param("repo_id", repo_id)
 
-    txn.run(remove_functions)
-        .await
+
+    })
         .context("Failed to delete function nodes")?;
 
     Ok(())
@@ -151,70 +211,26 @@ pub async fn store_graph(
     library_dependencies: &[LibraryDependency],
     communication_analysis: &CommunicationAnalysis,
     config: Option<BatchConfig>,
+    progress_tx: Option<tokio::sync::mpsc::Sender<i32>>,
 ) -> Result<()> {
     let config = config.unwrap_or_default();
-    let max_retries = 3;
-    let mut attempt = 0;
-
-    loop {
-        attempt += 1;
-        info!("💾 Starting batch Neo4j storage attempt {}/{} (batch_size={})", attempt, max_retries, config.batch_size);
-
-        let mut txn = match graph_db.start_txn().await {
-            Ok(t) => t,
-            Err(e) => {
-                if attempt >= max_retries {
-                    return Err(anyhow::anyhow!("Failed to start transaction after {} attempts: {}", max_retries, e));
-                }
-                warn!("⚠️ Transaction start failed (attempt {}): {}. Retrying...", attempt, e);
-                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
-                continue;
-            }
-        };
-
-        let result = execute_batch_operations(
-            &mut txn, 
-            job_id, 
-            repo_id, 
-            parsed_files, 
-            dep_graph, 
-            git_contributions,
-            boundary_result,
-            library_dependencies,
-            communication_analysis,
-            &config
-        ).await;
-
-        match result {
-            Ok(_) => {
-                match txn.commit().await {
-                    Ok(_) => {
-                        info!("✅ Transaction committed successfully on attempt {}", attempt);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        if attempt >= max_retries {
-                            return Err(anyhow::anyhow!("Failed to commit transaction after {} attempts: {}", max_retries, e));
-                        }
-                        warn!("⚠️ Transaction commit failed (attempt {}): {}. Retrying entire batch...", attempt, e);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("❌ Error during batch insert on attempt {}, rolling back: {}", attempt, e);
-                let _ = txn.rollback().await;
-                if attempt >= max_retries {
-                    return Err(e);
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
-            }
-        }
-    }
+    execute_batch_operations(
+        graph_db, 
+        job_id, 
+        repo_id, 
+        parsed_files, 
+        dep_graph, 
+        git_contributions,
+        boundary_result,
+        library_dependencies,
+        communication_analysis,
+        &config,
+        progress_tx
+    ).await
 }
 
 async fn execute_batch_operations(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     job_id: &str,
     repo_id: &str,
     parsed_files: &[ParsedFile],
@@ -224,7 +240,14 @@ async fn execute_batch_operations(
     library_dependencies: &[LibraryDependency],
     communication_analysis: &CommunicationAnalysis,
     config: &BatchConfig,
+    progress_tx: Option<tokio::sync::mpsc::Sender<i32>>,
 ) -> Result<()> {
+    let update_prog = |p: i32| {
+        if let Some(tx) = &progress_tx {
+            let _ = tx.try_send(p);
+        }
+    };
+
     // 1. Create Job node
     create_job_node(txn, job_id, repo_id).await?;
 
@@ -289,98 +312,47 @@ pub async fn store_graph_incremental(
     changed_files: &[String],
     removed_files: &[String],
     config: Option<BatchConfig>,
+    progress_tx: Option<tokio::sync::mpsc::Sender<i32>>,
 ) -> Result<()> {
     let config = config.unwrap_or_default();
-    let max_retries = 3;
-    let mut attempt = 0;
-
     let mut files_to_remove = Vec::new();
     files_to_remove.extend_from_slice(changed_files);
     files_to_remove.extend_from_slice(removed_files);
     files_to_remove.sort();
     files_to_remove.dedup();
 
-    loop {
-        attempt += 1;
-        info!("💾 Starting incremental Neo4j storage attempt {}/{} (batch_size={})", attempt, max_retries, config.batch_size);
+    delete_file_nodes(graph_db, repo_id, &files_to_remove).await?;
 
-        let mut txn = match graph_db.start_txn().await {
-            Ok(t) => t,
-            Err(e) => {
-                if attempt >= max_retries {
-                    return Err(anyhow::anyhow!("Failed to start transaction after {} attempts: {}", max_retries, e));
-                }
-                warn!("⚠️ Transaction start failed (attempt {}): {}. Retrying...", attempt, e);
-                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
-                continue;
-            }
-        };
-
-        if let Err(e) = delete_file_nodes(&mut txn, repo_id, &files_to_remove).await {
-            let _ = txn.rollback().await;
-            if attempt >= max_retries {
-                return Err(e);
-            }
-            warn!("⚠️ Error deleting file nodes (attempt {}): {}. Retrying...", attempt, e);
-            tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
-            continue;
-        }
-
-        let result = execute_batch_operations(
-            &mut txn,
-            job_id,
-            repo_id,
-            parsed_files,
-            dep_graph,
-            git_contributions,
-            boundary_result,
-            library_dependencies,
-            communication_analysis,
-            &config,
-        )
-        .await;
-
-        match result {
-            Ok(_) => {
-                match txn.commit().await {
-                    Ok(_) => {
-                        info!("✅ Incremental transaction committed successfully on attempt {}", attempt);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        if attempt >= max_retries {
-                            return Err(anyhow::anyhow!("Failed to commit transaction after {} attempts: {}", max_retries, e));
-                        }
-                        warn!("⚠️ Transaction commit failed (attempt {}): {}. Retrying entire batch...", attempt, e);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("❌ Error during incremental insert on attempt {}, rolling back: {}", attempt, e);
-                let _ = txn.rollback().await;
-                if attempt >= max_retries {
-                    return Err(e);
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << (attempt - 1)))).await;
-            }
-        }
-    }
+    execute_batch_operations(
+        graph_db,
+        job_id,
+        repo_id,
+        parsed_files,
+        dep_graph,
+        git_contributions,
+        boundary_result,
+        library_dependencies,
+        communication_analysis,
+        &config,
+        progress_tx
+    )
+    .await
 }
-
 // ============================================================================
 // Job Node
 // ============================================================================
 
-async fn create_job_node(txn: &mut neo4rs::Txn, job_id: &str, repo_id: &str) -> Result<()> {
-    let q = query(
+async fn create_job_node(graph_db: &neo4rs::Graph, job_id: &str, repo_id: &str) -> Result<()> {
+    retry_query!(graph_db, {
+
+        query(
         "MERGE (j:Job {id: $id, repo_id: $repo_id})
          SET j.status = 'COMPLETED', j.timestamp = datetime()"
     )
     .param("id", job_id)
-    .param("repo_id", repo_id);
-    
-    txn.run(q).await.context("Failed to create job node")?;
+    .param("repo_id", repo_id)
+
+    }).context("Failed to create job node")?;
     info!("   Created Job node: {}", job_id);
     Ok(())
 }
@@ -390,7 +362,7 @@ async fn create_job_node(txn: &mut neo4rs::Txn, job_id: &str, repo_id: &str) -> 
 // ============================================================================
 
 async fn batch_insert_file_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     job_id: &str,
     repo_id: &str,
     parsed_files: &[ParsedFile],
@@ -431,7 +403,9 @@ async fn batch_insert_file_nodes(
         .collect();
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (f:File {id: node.id})
              SET f.path = node.path,
@@ -444,9 +418,9 @@ async fn batch_insert_file_nodes(
                  f.lines_changed_total = COALESCE(node.lines_changed_total, 0),
                  f.contributors = COALESCE(node.contributors, [])"
         )
-        .param("nodes", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert file nodes")?;
+        .param("nodes", chunk.to_vec())
+
+        }).context("Failed to batch insert file nodes")?;
     }
     
     info!("   Inserted {} File nodes", nodes.len());
@@ -454,7 +428,7 @@ async fn batch_insert_file_nodes(
 }
 
 async fn batch_insert_class_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     job_id: &str,
     repo_id: &str,
     parsed_files: &[ParsedFile],
@@ -469,7 +443,9 @@ async fn batch_insert_class_nodes(
     }
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (c:Class {id: node.id})
              SET c.name = node.name,
@@ -479,9 +455,9 @@ async fn batch_insert_class_nodes(
                  c.job_id = node.job_id,
                  c.repo_id = node.repo_id"
         )
-        .param("nodes", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert class nodes")?;
+        .param("nodes", chunk.to_vec())
+
+        }).context("Failed to batch insert class nodes")?;
     }
     
     info!("   Inserted {} Class nodes", nodes.len());
@@ -489,7 +465,7 @@ async fn batch_insert_class_nodes(
 }
 
 async fn batch_insert_function_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     job_id: &str,
     repo_id: &str,
     parsed_files: &[ParsedFile],
@@ -512,7 +488,9 @@ async fn batch_insert_function_nodes(
     }
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (fn:Function {id: node.id})
              SET fn.name = node.name,
@@ -524,9 +502,9 @@ async fn batch_insert_function_nodes(
                  fn.job_id = node.job_id,
                  fn.repo_id = node.repo_id"
         )
-        .param("nodes", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert function nodes")?;
+        .param("nodes", chunk.to_vec())
+
+        }).context("Failed to batch insert function nodes")?;
     }
     
     info!("   Inserted {} Function nodes", nodes.len());
@@ -534,7 +512,7 @@ async fn batch_insert_function_nodes(
 }
 
 async fn batch_insert_module_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     job_id: &str,
     repo_id: &str,
     dep_graph: &DependencyGraph,
@@ -553,15 +531,17 @@ async fn batch_insert_module_nodes(
         .collect();
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (m:Module {name: node.name})
              SET m.job_id = node.job_id,
                  m.repo_id = node.repo_id"
         )
-        .param("nodes", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert module nodes")?;
+        .param("nodes", chunk.to_vec())
+
+        }).context("Failed to batch insert module nodes")?;
     }
     
     info!("   Inserted {} Module nodes", nodes.len());
@@ -569,7 +549,7 @@ async fn batch_insert_module_nodes(
 }
 
 async fn batch_insert_library_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     job_id: &str,
     repo_id: &str,
     library_dependencies: &[LibraryDependency],
@@ -588,16 +568,18 @@ async fn batch_insert_library_nodes(
     }
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (l:Library {name: node.name, repo_id: node.repo_id})
              SET l.version = CASE WHEN node.version <> '' THEN node.version ELSE l.version END,
                  l.source_file = node.source_file,
                  l.job_id = node.job_id"
         )
-        .param("nodes", chunk.to_vec());
+        .param("nodes", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert library nodes")?;
+        }).context("Failed to batch insert library nodes")?;
     }
 
     info!("   Inserted {} Library nodes", nodes.len());
@@ -623,7 +605,7 @@ fn normalize_import_to_library(import_path: &str) -> Option<String> {
 }
 
 async fn batch_insert_library_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     parsed_files: &[ParsedFile],
     library_dependencies: &[LibraryDependency],
@@ -654,7 +636,9 @@ async fn batch_insert_library_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (l:Library {name: edge.library_name, repo_id: edge.repo_id})
@@ -662,9 +646,9 @@ async fn batch_insert_library_edges(
              SET r.type = 'library',
                  r.version = edge.library_version"
         )
-        .param("edges", chunk.to_vec());
+        .param("edges", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert library edges")?;
+        }).context("Failed to batch insert library edges")?;
     }
 
     info!("   Created {} Library DEPENDS_ON edges", edges.len());
@@ -672,7 +656,7 @@ async fn batch_insert_library_edges(
 }
 
 async fn batch_insert_table_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     parsed_files: &[ParsedFile],
     batch_size: usize,
@@ -692,13 +676,15 @@ async fn batch_insert_table_nodes(
     }
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (t:Table {name: node.name, repo_id: node.repo_id})"
         )
-        .param("nodes", chunk.to_vec());
+        .param("nodes", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert table nodes")?;
+        }).context("Failed to batch insert table nodes")?;
     }
 
     info!("   Inserted {} Table nodes", nodes.len());
@@ -706,7 +692,7 @@ async fn batch_insert_table_nodes(
 }
 
 async fn batch_insert_table_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     parsed_files: &[ParsedFile],
     batch_size: usize,
@@ -723,15 +709,17 @@ async fn batch_insert_table_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (t:Table {name: edge.table_name, repo_id: edge.repo_id})
              MERGE (f)-[:USES_TABLE]->(t)"
         )
-        .param("edges", chunk.to_vec());
+        .param("edges", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert table edges")?;
+        }).context("Failed to batch insert table edges")?;
     }
 
     info!("   Created {} USES_TABLE edges", edges.len());
@@ -739,7 +727,7 @@ async fn batch_insert_table_edges(
 }
 
 async fn batch_insert_service_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     parsed_files: &[ParsedFile],
     batch_size: usize,
@@ -761,13 +749,15 @@ async fn batch_insert_service_nodes(
     }
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (s:Service {name: node.name, protocol: node.protocol, repo_id: node.repo_id})"
         )
-        .param("nodes", chunk.to_vec());
+        .param("nodes", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert service nodes")?;
+        }).context("Failed to batch insert service nodes")?;
     }
 
     info!("   Inserted {} Service nodes", nodes.len());
@@ -775,7 +765,7 @@ async fn batch_insert_service_nodes(
 }
 
 async fn batch_insert_service_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     parsed_files: &[ParsedFile],
     batch_size: usize,
@@ -793,15 +783,17 @@ async fn batch_insert_service_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (s:Service {name: edge.service_name, protocol: edge.service_protocol, repo_id: edge.repo_id})
              MERGE (f)-[:CALLS_SERVICE]->(s)"
         )
-        .param("edges", chunk.to_vec());
+        .param("edges", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert service edges")?;
+        }).context("Failed to batch insert service edges")?;
     }
 
     info!("   Created {} CALLS_SERVICE edges", edges.len());
@@ -809,7 +801,7 @@ async fn batch_insert_service_edges(
 }
 
 async fn batch_insert_endpoint_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     communication_analysis: &CommunicationAnalysis,
     batch_size: usize,
@@ -830,14 +822,16 @@ async fn batch_insert_endpoint_nodes(
     }
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (e:Endpoint {url: node.url, method: node.method, repo_id: node.repo_id})
              SET e.host = node.host"
         )
-        .param("nodes", chunk.to_vec());
+        .param("nodes", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert Endpoint nodes")?;
+        }).context("Failed to batch insert Endpoint nodes")?;
     }
 
     info!("   Inserted {} Endpoint nodes", nodes.len());
@@ -845,7 +839,7 @@ async fn batch_insert_endpoint_nodes(
 }
 
 async fn batch_insert_endpoint_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     communication_analysis: &CommunicationAnalysis,
     batch_size: usize,
@@ -862,15 +856,17 @@ async fn batch_insert_endpoint_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (e:Endpoint {url: edge.url, method: edge.method, repo_id: edge.repo_id})
              MERGE (f)-[:CALLS_ENDPOINT]->(e)"
         )
-        .param("edges", chunk.to_vec());
+        .param("edges", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert CALLS_ENDPOINT edges")?;
+        }).context("Failed to batch insert CALLS_ENDPOINT edges")?;
     }
 
     info!("   Created {} CALLS_ENDPOINT edges", edges.len());
@@ -878,7 +874,7 @@ async fn batch_insert_endpoint_edges(
 }
 
 async fn batch_insert_rpc_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     communication_analysis: &CommunicationAnalysis,
     batch_size: usize,
@@ -896,13 +892,15 @@ async fn batch_insert_rpc_nodes(
     }
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (r:RpcService {name: node.name, repo_id: node.repo_id})"
         )
-        .param("nodes", chunk.to_vec());
+        .param("nodes", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert RpcService nodes")?;
+        }).context("Failed to batch insert RpcService nodes")?;
     }
 
     info!("   Inserted {} RpcService nodes", nodes.len());
@@ -910,7 +908,7 @@ async fn batch_insert_rpc_nodes(
 }
 
 async fn batch_insert_rpc_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     communication_analysis: &CommunicationAnalysis,
     batch_size: usize,
@@ -926,15 +924,17 @@ async fn batch_insert_rpc_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (r:RpcService {name: edge.service_name, repo_id: edge.repo_id})
              MERGE (f)-[:CALLS_RPC]->(r)"
         )
-        .param("edges", chunk.to_vec());
+        .param("edges", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert CALLS_RPC edges")?;
+        }).context("Failed to batch insert CALLS_RPC edges")?;
     }
 
     info!("   Created {} CALLS_RPC edges", edges.len());
@@ -942,7 +942,7 @@ async fn batch_insert_rpc_edges(
 }
 
 async fn batch_insert_queue_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     communication_analysis: &CommunicationAnalysis,
     batch_size: usize,
@@ -960,13 +960,15 @@ async fn batch_insert_queue_nodes(
     }
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (q:MessageQueue {topic: node.topic, repo_id: node.repo_id})"
         )
-        .param("nodes", chunk.to_vec());
+        .param("nodes", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert MessageQueue nodes")?;
+        }).context("Failed to batch insert MessageQueue nodes")?;
     }
 
     info!("   Inserted {} MessageQueue nodes", nodes.len());
@@ -974,7 +976,7 @@ async fn batch_insert_queue_nodes(
 }
 
 async fn batch_insert_queue_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     communication_analysis: &CommunicationAnalysis,
     batch_size: usize,
@@ -994,27 +996,31 @@ async fn batch_insert_queue_edges(
     }
 
     for chunk in publish_edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (q:MessageQueue {topic: edge.topic, repo_id: edge.repo_id})
              MERGE (f)-[:PUBLISHES_TO]->(q)"
         )
-        .param("edges", chunk.to_vec());
+        .param("edges", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert PUBLISHES_TO edges")?;
+        }).context("Failed to batch insert PUBLISHES_TO edges")?;
     }
 
     for chunk in consume_edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (q:MessageQueue {topic: edge.topic, repo_id: edge.repo_id})
              MERGE (f)-[:CONSUMES_FROM]->(q)"
         )
-        .param("edges", chunk.to_vec());
+        .param("edges", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert CONSUMES_FROM edges")?;
+        }).context("Failed to batch insert CONSUMES_FROM edges")?;
     }
 
     info!(
@@ -1026,7 +1032,7 @@ async fn batch_insert_queue_edges(
 }
 
 async fn batch_insert_compose_service_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     communication_analysis: &CommunicationAnalysis,
     batch_size: usize,
@@ -1042,14 +1048,16 @@ async fn batch_insert_compose_service_nodes(
     }
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (s:ComposeService {name: node.name, repo_id: node.repo_id})
              SET s.ports = node.ports"
         )
-        .param("nodes", chunk.to_vec());
+        .param("nodes", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert ComposeService nodes")?;
+        }).context("Failed to batch insert ComposeService nodes")?;
     }
 
     info!("   Inserted {} ComposeService nodes", nodes.len());
@@ -1057,7 +1065,7 @@ async fn batch_insert_compose_service_nodes(
 }
 
 async fn batch_insert_endpoint_service_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     communication_analysis: &CommunicationAnalysis,
     batch_size: usize,
@@ -1085,15 +1093,17 @@ async fn batch_insert_endpoint_service_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (e:Endpoint {url: edge.url, method: edge.method, repo_id: edge.repo_id})
              MATCH (s:ComposeService {name: edge.service_name, repo_id: edge.repo_id})
              MERGE (e)-[:EXPOSED_BY]->(s)"
         )
-        .param("edges", chunk.to_vec());
+        .param("edges", chunk.to_vec())
 
-        txn.run(q).await.context("Failed to batch insert EXPOSED_BY edges")?;
+        }).context("Failed to batch insert EXPOSED_BY edges")?;
     }
 
     info!("   Created {} EXPOSED_BY edges", edges.len());
@@ -1105,7 +1115,7 @@ async fn batch_insert_endpoint_service_edges(
 // ============================================================================
 
 async fn batch_insert_defines_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
@@ -1141,28 +1151,32 @@ async fn batch_insert_defines_edges(
 
     // Batch File->Class DEFINES
     for chunk in file_to_class.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (c:Class {id: edge.class_id, repo_id: edge.repo_id})
              MERGE (f)-[:DEFINES]->(c)"
         )
-        .param("edges", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert File->Class DEFINES")?;
+        .param("edges", chunk.to_vec())
+
+        }).context("Failed to batch insert File->Class DEFINES")?;
     }
 
     // Batch File->Function DEFINES
     for chunk in file_to_func.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (fn:Function {id: edge.func_id, repo_id: edge.repo_id})
              MERGE (f)-[:DEFINES]->(fn)"
         )
-        .param("edges", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert File->Function DEFINES")?;
+        .param("edges", chunk.to_vec())
+
+        }).context("Failed to batch insert File->Function DEFINES")?;
     }
     
     info!("   Created {} DEFINES edges", file_to_class.len() + file_to_func.len());
@@ -1170,7 +1184,7 @@ async fn batch_insert_defines_edges(
 }
 
 async fn batch_insert_contains_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
@@ -1197,15 +1211,17 @@ async fn batch_insert_contains_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (c:Class {id: edge.class_id, repo_id: edge.repo_id})
              MATCH (fn:Function {id: edge.func_id, repo_id: edge.repo_id})
              MERGE (c)-[:CONTAINS]->(fn)"
         )
-        .param("edges", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert CONTAINS edges")?;
+        .param("edges", chunk.to_vec())
+
+        }).context("Failed to batch insert CONTAINS edges")?;
     }
     
     info!("   Created {} CONTAINS edges", edges.len());
@@ -1213,7 +1229,7 @@ async fn batch_insert_contains_edges(
 }
 
 async fn batch_insert_calls_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
@@ -1240,15 +1256,17 @@ async fn batch_insert_calls_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (from:Function {id: edge.from_id, repo_id: edge.repo_id})
              MATCH (to:Function {id: edge.to_id, repo_id: edge.repo_id})
              MERGE (from)-[:CALLS]->(to)"
         )
-        .param("edges", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert CALLS edges")?;
+        .param("edges", chunk.to_vec())
+
+        }).context("Failed to batch insert CALLS edges")?;
     }
     
     info!("   Created {} CALLS edges", edges.len());
@@ -1256,7 +1274,7 @@ async fn batch_insert_calls_edges(
 }
 
 async fn batch_insert_imports_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
@@ -1278,15 +1296,17 @@ async fn batch_insert_imports_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {path: edge.file_path, repo_id: edge.repo_id})
              MATCH (m:Module {name: edge.module_name, repo_id: edge.repo_id})
              MERGE (f)-[:IMPORTS]->(m)"
         )
-        .param("edges", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert IMPORTS edges")?;
+        .param("edges", chunk.to_vec())
+
+        }).context("Failed to batch insert IMPORTS edges")?;
     }
     
     info!("   Created {} IMPORTS edges", edges.len());
@@ -1294,7 +1314,7 @@ async fn batch_insert_imports_edges(
 }
 
 async fn batch_insert_inherits_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     dep_graph: &DependencyGraph,
     batch_size: usize,
@@ -1341,30 +1361,34 @@ async fn batch_insert_inherits_edges(
 
     // Batch Class->Class INHERITS
     for chunk in class_to_class.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (child:Class {id: edge.from_id, repo_id: edge.repo_id})
              MATCH (parent:Class {id: edge.to_id, repo_id: edge.repo_id})
                MERGE (child)-[r:INHERITS]->(parent)
                SET r.type = edge.inheritance_type"
         )
-        .param("edges", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert Class->Class INHERITS")?;
+        .param("edges", chunk.to_vec())
+
+        }).context("Failed to batch insert Class->Class INHERITS")?;
     }
 
     // Batch Class->Module INHERITS (external)
     for chunk in class_to_module.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (child:Class {id: edge.class_id, repo_id: edge.repo_id})
              MATCH (parent:Module {name: edge.module_name, repo_id: edge.repo_id})
                MERGE (child)-[r:INHERITS]->(parent)
                SET r.type = edge.inheritance_type"
         )
-        .param("edges", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert Class->Module INHERITS")?;
+        .param("edges", chunk.to_vec())
+
+        }).context("Failed to batch insert Class->Module INHERITS")?;
     }
     
     info!("   Created {} INHERITS edges", class_to_class.len() + class_to_module.len());
@@ -1376,7 +1400,7 @@ async fn batch_insert_inherits_edges(
 // ============================================================================
 
 async fn batch_insert_boundary_nodes(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     job_id: &str,
     repo_id: &str,
     boundary_result: &BoundaryDetectionResult,
@@ -1403,7 +1427,9 @@ async fn batch_insert_boundary_nodes(
         .collect();
 
     for chunk in nodes.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $nodes AS node
              MERGE (b:Boundary {id: node.id})
              SET b.name = node.name,
@@ -1414,9 +1440,9 @@ async fn batch_insert_boundary_nodes(
                  b.file_count = node.file_count,
                  b.layer = COALESCE(node.layer, '')"
         )
-        .param("nodes", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert boundary nodes")?;
+        .param("nodes", chunk.to_vec())
+
+        }).context("Failed to batch insert boundary nodes")?;
     }
     
     info!("   Inserted {} Boundary nodes", nodes.len());
@@ -1424,7 +1450,7 @@ async fn batch_insert_boundary_nodes(
 }
 
 async fn batch_insert_belongs_to_edges(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     boundary_result: &BoundaryDetectionResult,
     batch_size: usize,
@@ -1442,15 +1468,17 @@ async fn batch_insert_belongs_to_edges(
     }
 
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (f:File {id: edge.file_id, repo_id: edge.repo_id})
              MATCH (b:Boundary {id: edge.boundary_id, repo_id: edge.repo_id})
              MERGE (f)-[:BELONGS_TO]->(b)"
         )
-        .param("edges", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert BELONGS_TO edges")?;
+        .param("edges", chunk.to_vec())
+
+        }).context("Failed to batch insert BELONGS_TO edges")?;
     }
     
     info!("   Created {} BELONGS_TO edges", edges.len());
@@ -1459,7 +1487,7 @@ async fn batch_insert_belongs_to_edges(
 
 /// Create file-to-file DEPENDS_ON edges based on import resolution
 async fn batch_insert_file_dependencies(
-    txn: &mut neo4rs::Txn,
+    graph_db: &neo4rs::Graph,
     repo_id: &str,
     parsed_files: &[ParsedFile],
     batch_size: usize,
@@ -1538,16 +1566,18 @@ async fn batch_insert_file_dependencies(
     
     // Batch insert edges
     for chunk in edges.chunks(batch_size) {
-        let q = query(
+        retry_query!(graph_db, {
+
+            query(
             "UNWIND $edges AS edge
              MATCH (source:File {path: edge.source_file, repo_id: edge.repo_id})
              MATCH (target:File {path: edge.target_file, repo_id: edge.repo_id})
              MERGE (source)-[d:DEPENDS_ON]->(target)
              ON CREATE SET d.import_path = edge.import_path"
         )
-        .param("edges", chunk.to_vec());
-        
-        txn.run(q).await.context("Failed to batch insert DEPENDS_ON edges")?;
+        .param("edges", chunk.to_vec())
+
+        }).context("Failed to batch insert DEPENDS_ON edges")?;
     }
     
     info!("   Created {} DEPENDS_ON edges ({} imports resolved to files)", edges.len(), resolved_count);
@@ -1638,3 +1668,4 @@ mod tests {
     }
 }
 
+}

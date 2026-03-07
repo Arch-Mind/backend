@@ -84,6 +84,7 @@ struct PatchEdge {
     edge_type: String,
 }
 
+#[derive(Clone)]
 pub struct ApiClient {
     client: reqwest::Client,
     base_url: String,
@@ -127,6 +128,7 @@ struct Config {
     neo4j_password: String,
     api_gateway_url: String,
     git_max_commits: usize,
+    neo4j_batch_size: usize,
 }
 
 impl Config {
@@ -143,6 +145,10 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(1000),
+            neo4j_batch_size: env::var("NEO4J_BATCH_SIZE")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(100),
         })
     }
 }
@@ -286,7 +292,7 @@ async fn main() -> Result<()> {
     // Main worker loop
     info!("👂 Listening for jobs on analysis_queue...");
     while !shutdown.load(Ordering::SeqCst) {
-        match process_job(&mut redis_conn, &neo4j_graph, &api_client, config.git_max_commits).await {
+        match process_job(&mut redis_conn, &neo4j_graph, &api_client, config.git_max_commits, config.neo4j_batch_size).await {
             Ok(processed) => {
                 if !processed {
                     // No job available, sleep briefly
@@ -339,6 +345,7 @@ async fn process_job(
     neo4j_graph: &neo4rs::Graph,
     api_client: &ApiClient,
     git_max_commits: usize,
+    neo4j_batch_size: usize,
 ) -> Result<bool> {
     // Use RPOP instead of BRPOP for compatibility with Redis 3.x (Windows)
     // which doesn't support float timeouts sent by the redis crate
@@ -367,7 +374,7 @@ async fn process_job(
         }
 
         // Process the job
-        match analyze_repository(&job, neo4j_graph, api_client, git_max_commits).await {
+        match analyze_repository(&job, neo4j_graph, api_client, git_max_commits, neo4j_batch_size).await {
             Ok(summary) => {
                 info!("✅ Successfully processed job: {}", job.job_id);
                 // Update status to COMPLETED
@@ -439,6 +446,7 @@ async fn analyze_repository(
     neo4j_graph: &neo4rs::Graph,
     api_client: &ApiClient,
     git_max_commits: usize,
+    neo4j_batch_size: usize,
 ) -> Result<serde_json::Value> {
     info!("🔍 Analyzing repository: {}", job.repo_url);
 
@@ -557,6 +565,25 @@ async fn analyze_repository(
     }
 
     // Step 7: Store in Neo4j (batch operations with transactions)
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<i32>(100);
+    let worker_api = api_client.clone();
+    let worker_job_id = job.job_id.clone();
+    
+    tokio::spawn(async move {
+        while let Some(p) = progress_rx.recv().await {
+            let _ = worker_api.update_job(&worker_job_id, JobUpdatePayload {
+                status: None,
+                progress: Some(p),
+                result_summary: None,
+                error: None,
+            }).await;
+        }
+    });
+
+    let batch_config = neo4j_storage::BatchConfig { 
+        batch_size: neo4j_batch_size 
+    };
+
     if incremental {
         neo4j_storage::store_graph_incremental(
             neo4j_graph,
@@ -570,7 +597,8 @@ async fn analyze_repository(
             &communication_analysis,
             &changed_files,
             &removed_files,
-            None,
+            Some(batch_config),
+            Some(progress_tx.clone()),
         ).await?;
         info!("💾 Stored incremental graph update in Neo4j");
     } else {
@@ -584,7 +612,8 @@ async fn analyze_repository(
             &boundary_result,
             &library_dependencies,
             &communication_analysis,
-            None,
+            Some(batch_config),
+            Some(progress_tx.clone()),
         ).await?;
         info!("💾 Stored graph data in Neo4j (batch mode)");
     }
