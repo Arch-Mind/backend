@@ -1667,5 +1667,3 @@ mod tests {
         assert_eq!(get_qualified_id(file, name), expected);
     }
 }
-
-}
