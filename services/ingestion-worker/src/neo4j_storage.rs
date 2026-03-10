@@ -1523,11 +1523,16 @@ async fn batch_insert_file_dependencies(
                 resolved_files.extend(module_to_files.get(import).unwrap().clone());
             }
             
-            // Try extracting last part of import path (e.g., "./utils/helper" -> "helper")
+            // Try extracting last part of import path (e.g., "./utils/helper" -> "helper",
+            // "./fileA.js" -> "fileA.js" then also "fileA" after extension strip)
             if let Some(last_part) = import.split('/').last() {
                 let clean_part = last_part.trim_start_matches("./").trim_start_matches("../");
-                if module_to_files.contains_key(clean_part) {
-                    resolved_files.extend(module_to_files.get(clean_part).unwrap().clone());
+                // Strip file extension so "fileA.js" matches the stem key "fileA"
+                let stem = clean_part.rfind('.').map(|p| &clean_part[..p]).unwrap_or(clean_part);
+                for key in &[clean_part, stem] {
+                    if module_to_files.contains_key(*key) {
+                        resolved_files.extend(module_to_files.get(*key).unwrap().clone());
+                    }
                 }
             }
             
@@ -1535,8 +1540,11 @@ async fn batch_insert_file_dependencies(
             if import.starts_with("./") || import.starts_with("../") {
                 let import_parts: Vec<&str> = import.split('/').filter(|p| !p.is_empty() && *p != ".." && *p != ".").collect();
                 if let Some(last_part) = import_parts.last() {
-                    if module_to_files.contains_key(*last_part) {
-                        resolved_files.extend(module_to_files.get(*last_part).unwrap().clone());
+                    let stem = last_part.rfind('.').map(|p| &last_part[..p]).unwrap_or(last_part);
+                    for key in &[*last_part, stem] {
+                        if module_to_files.contains_key(*key) {
+                            resolved_files.extend(module_to_files.get(*key).unwrap().clone());
+                        }
                     }
                 }
             }
