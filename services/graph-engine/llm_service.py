@@ -1,201 +1,124 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
-
-import httpx
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
-class LLMSettings:
-    provider: str
-    model: str
-    openai_api_key: Optional[str]
-    anthropic_api_key: Optional[str]
-    gemini_api_key: Optional[str]
-    ollama_url: str
-    aws_region: str
-    bedrock_model_id: str
+class GeminiSettings:
+    gemini_api_key: str
+    model: str = "gemini-2.0-flash"
 
     @staticmethod
-    def from_env() -> "LLMSettings":
-        return LLMSettings(
-            provider=os.getenv("LLM_PROVIDER", "openai"),
-            model=os.getenv("LLM_MODEL", "gpt-4"),
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
-            gemini_api_key=os.getenv("GEMINI_API_KEY"),
-            ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
-            aws_region=os.getenv("AWS_REGION", "us-east-1"),
-            bedrock_model_id=os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"),
+    def from_env() -> "GeminiSettings":
+        key = os.getenv("GEMINI_API_KEY", "")
+        if not key:
+            raise ValueError("GEMINI_API_KEY environment variable is not set")
+        return GeminiSettings(
+            gemini_api_key=key,
+            model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
         )
 
 
-def call_llm(prompt: str, settings: LLMSettings) -> str:
-    provider = settings.provider.lower()
-
-    if provider == "openai":
-        return call_openai(prompt, settings)
-    if provider == "anthropic":
-        return call_anthropic(prompt, settings)
-    if provider == "gemini":
-        return call_gemini(prompt, settings)
-    if provider == "ollama":
-        return call_ollama(prompt, settings)
-    if provider == "bedrock":
-        return call_bedrock(prompt, settings)
-
-    raise ValueError(f"Unsupported LLM provider: {settings.provider}")
+# Backward-compatible alias kept so existing imports in main.py continue to work
+LLMSettings = GeminiSettings
 
 
-def call_openai(prompt: str, settings: LLMSettings) -> str:
-    if not settings.openai_api_key:
-        raise ValueError("OPENAI_API_KEY is required for OpenAI provider")
-
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": settings.model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": 900,
-    }
-
-    with httpx.Client(timeout=60) as client:
-        resp = client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-
-
-def call_anthropic(prompt: str, settings: LLMSettings) -> str:
-    if not settings.anthropic_api_key:
-        raise ValueError("ANTHROPIC_API_KEY is required for Anthropic provider")
-
-    headers = {
-        "x-api-key": settings.anthropic_api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": settings.model,
-        "max_tokens": 900,
-        "temperature": 0.2,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-
-    with httpx.Client(timeout=60) as client:
-        resp = client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        content = data.get("content", [])
-        if content:
-            return content[0].get("text", "").strip()
-        return ""
-
-
-def call_ollama(prompt: str, settings: LLMSettings) -> str:
-    payload = {
-        "model": settings.model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.2},
-    }
-
-    with httpx.Client(timeout=60) as client:
-        resp = client.post(f"{settings.ollama_url.rstrip('/')}/api/generate", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("response", "").strip()
-
-
-def call_bedrock(prompt: str, settings: LLMSettings) -> str:
-    import boto3
-
-    client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
-    payload = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 900,
-        "temperature": 0.2,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-
-    response = client.invoke_model(
-        modelId=settings.bedrock_model_id,
-        body=json.dumps(payload),
-        accept="application/json",
-        contentType="application/json",
-    )
-
-    body = response.get("body")
-    if hasattr(body, "read"):
-        body = body.read()
-
-    data = json.loads(body)
-    content = data.get("content", [])
-    if content:
-        return content[0].get("text", "").strip()
-
-    return data.get("completion", "").strip()
-
-
-def call_gemini(prompt: str, settings: LLMSettings) -> str:
+def call_gemini(prompt: str, settings: GeminiSettings) -> str:
     if not settings.gemini_api_key:
-        raise ValueError("GEMINI_API_KEY is required for Gemini provider")
+        raise ValueError("GEMINI_API_KEY is required")
 
     try:
         from google import genai
-        
-        # Set API key environment variable for the SDK
+
         os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
-        
         client = genai.Client()
-        model = settings.model or "gemini-1.5-flash"
-        
+
         response = client.models.generate_content(
-            model=model, 
-            contents=prompt
+            model=settings.model,
+            contents=prompt,
         )
-        
         return response.text.strip()
     except Exception as e:
         raise ValueError(f"Gemini API error: {str(e)}")
 
 
+# Backward-compatible alias
+def call_llm(prompt: str, settings: GeminiSettings) -> str:
+    return call_gemini(prompt, settings)
+
+
 def build_pattern_prompt(summary: Dict[str, Any]) -> str:
-    return "\n".join(
-        [
-            "You are an architecture analyst.",
-            "Given the graph summary, classify the architecture pattern as one of:",
-            "monolithic, microservices, layered, hexagonal, event-driven, or mixed.",
-            "Return JSON with fields: pattern_type, confidence (0-1), summary.",
-            "",
-            "Graph summary:",
-            json.dumps(summary, indent=2),
-        ]
+    language_dist = summary.get("language_dist", {})
+    top_files = summary.get("top_files_by_degree", [])
+    circular_count = summary.get("circular_dep_count", 0)
+    edge_density = summary.get("edge_density", 0.0)
+    file_count = summary.get("file_count", 0)
+    boundaries = summary.get("boundaries", [])
+
+    return (
+        "You are a senior software architect analysing a codebase dependency graph.\n"
+        "\nRepository stats:\n"
+        f"- Total files: {file_count}\n"
+        f"- Language distribution: {json.dumps(language_dist)}\n"
+        f"- Modules/boundaries: {len(boundaries)}\n"
+        f"- Circular dependency chains: {circular_count}\n"
+        f"- Edge density (avg deps per file): {edge_density:.2f}\n"
+        f"- Most-connected files (top 10 by out-degree): {json.dumps(top_files[:10])}\n"
+        "\nBased on these metrics, classify the overall architecture and identify patterns and anti-patterns.\n"
+        "\nReturn ONLY valid JSON (no markdown fences) with this exact schema:\n"
+        "{\n"
+        '  "pattern_type": "<one of: monolithic | microservices | layered | hexagonal | event-driven | mixed>",\n'
+        '  "confidence": <float 0.0-1.0>,\n'
+        '  "summary": "<2-3 sentence plain-English overview of the architecture>",\n'
+        '  "patterns_found": ["<pattern name>"],\n'
+        '  "antipatterns": [{"name": "<name>", "severity": "<critical|high|medium|low>", "description": "<one sentence>"}],\n'
+        '  "recommendations": ["<actionable recommendation>"]\n'
+        "}"
     )
 
 
-def build_module_summary_prompt(module_name: str, files: list, dependencies: list) -> str:
-    return "\n".join(
-        [
-            "You are an architecture analyst.",
-            "Summarize this module's purpose and role in the architecture in 50-100 words.",
-            "Return JSON with fields: summary.",
-            "",
-            f"Module: {module_name}",
-            "Files:",
-            json.dumps(files, indent=2),
-            "Dependencies:",
-            json.dumps(dependencies, indent=2),
-        ]
+def build_module_summary_prompt(module_name: str, files: List[str], dependencies: List[Dict]) -> str:
+    return (
+        "You are a software architect.\n"
+        "Summarise this module's purpose and role in the architecture in 50-100 words.\n"
+        f"\nModule: {module_name}\n"
+        f"Files:\n{json.dumps(files, indent=2)}\n"
+        f"Dependencies (sample):\n{json.dumps(dependencies[:20], indent=2)}\n"
+        "\nReturn ONLY valid JSON (no markdown fences):\n"
+        '{"summary": "<text>", "role": "<presentation|business-logic|data-access|infrastructure|utility|api|config|test>", "coupling_concern": "<high|medium|low>"}'
+    )
+
+
+def build_file_summary_prompt(
+    file_path: str,
+    language: str,
+    functions: List[str],
+    classes: List[str],
+    imports_list: List[str],
+    dependents: List[str],
+) -> str:
+    return (
+        "You are a software architect.\n"
+        "Summarise this file's role in the codebase in 40-80 words.\n"
+        f"\nFile: {file_path}\n"
+        f"Language: {language or 'unknown'}\n"
+        f"Classes: {json.dumps(classes[:10])}\n"
+        f"Functions: {json.dumps(functions[:10])}\n"
+        f"Imports: {json.dumps(imports_list[:15])}\n"
+        f"Depended on by: {json.dumps(dependents[:10])}\n"
+        "\nReturn ONLY valid JSON (no markdown fences):\n"
+        '{"summary": "<text>", "role": "<presentation|business-logic|data-access|infrastructure|utility|api|config|test>", "coupling_concern": "<high|medium|low>"}'
     )
 
 
 def parse_json_response(text: str) -> Dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.split("\n")
+        inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        stripped = "\n".join(inner).strip()
     try:
-        return json.loads(text)
+        return json.loads(stripped)
     except json.JSONDecodeError:
         return {"summary": text}

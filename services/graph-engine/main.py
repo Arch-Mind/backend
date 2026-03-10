@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List, Optional
+import asyncio
 import json
 import os
 from dotenv import load_dotenv
@@ -13,10 +14,11 @@ from datetime import datetime, timedelta
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from llm_service import (
-    LLMSettings,
-    call_llm,
+    GeminiSettings,
+    call_gemini,
     build_pattern_prompt,
     build_module_summary_prompt,
+    build_file_summary_prompt,
     parse_json_response,
 )
 
@@ -267,33 +269,45 @@ def get_postgres_connection():
 def read_cached_insights(repo_id: str) -> Optional[Dict]:
     ttl = datetime.utcnow() - timedelta(hours=24)
     query = """
-    SELECT pattern_type, confidence, summary, generated_at
+    SELECT summary, generated_at
     FROM architecture_insights
-    WHERE repo_id = %s AND generated_at >= %s
+    WHERE repo_id = %s AND pattern_type = '_full_response_v2' AND generated_at >= %s
     ORDER BY generated_at DESC
+    LIMIT 1
     """
+    try:
+        with get_postgres_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (repo_id, ttl))
+                row = cur.fetchone()
 
-    with get_postgres_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, (repo_id, ttl))
-            rows = cur.fetchall()
+        if not row:
+            return None
 
-    if not rows:
+        data = json.loads(row[0])
+        data["cached"] = True
+        return data
+    except Exception as e:
+        logger.warning(f"Failed to read cached insights: {e}")
         return None
 
-    return {
-        "repo_id": repo_id,
-        "generated_at": rows[0][3].isoformat(),
-        "insights": [
-            {
-                "pattern_type": row[0],
-                "confidence": row[1],
-                "summary": row[2],
-                "generated_at": row[3].isoformat(),
-            }
-            for row in rows
-        ],
-    }
+
+def store_analysis_result(repo_id: str, result: Dict) -> None:
+    try:
+        with get_postgres_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM architecture_insights WHERE repo_id = %s AND pattern_type = '_full_response_v2'",
+                    (repo_id,),
+                )
+                cur.execute(
+                    "INSERT INTO architecture_insights (repo_id, pattern_type, confidence, summary, generated_at) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (repo_id, "_full_response_v2", None, json.dumps(result, default=str), datetime.utcnow()),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Failed to store analysis result: {e}")
 
 
 def store_insights(repo_id: str, insights: List[Dict]) -> None:
@@ -1530,93 +1544,225 @@ async def get_communication(repo_id: str):
 @app.post("/api/analyze/{repo_id}/architecture")
 async def analyze_architecture(repo_id: str, refresh: bool = False):
     """
-    Trigger architecture analysis and store insights in Postgres.
+    Trigger Gemini-powered architecture analysis and cache results in Postgres.
     """
     if not neo4j_driver:
         raise HTTPException(status_code=503, detail="Neo4j connection not available")
 
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    if not gemini_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured on the server")
+
     if not refresh:
         cached = read_cached_insights(repo_id)
         if cached:
-            return {"cached": True, **cached}
+            return cached
 
     try:
         with neo4j_driver.session() as session:
-            boundaries_query = """
-            MATCH (b:Boundary)
-            WHERE b.repo_id = $repo_id
-            OPTIONAL MATCH (f:File)-[:BELONGS_TO]->(b)
-            RETURN b.name as name, b.type as type, collect(f.path) as files
-            """
-            boundaries = [dict(record) for record in session.run(boundaries_query, repo_id=repo_id)]
+            # Boundary nodes
+            boundaries = [
+                dict(r)
+                for r in session.run(
+                    """
+                    MATCH (b:Boundary)
+                    WHERE b.repo_id = $repo_id
+                    OPTIONAL MATCH (f:File)-[:BELONGS_TO]->(b)
+                    RETURN b.name as name, b.type as type, collect(f.path) as files
+                    """,
+                    repo_id=repo_id,
+                )
+            ]
 
-            deps_query = """
-            MATCH (a)-[r]->(b)
-            WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id)
-            RETURN type(r) as type, count(*) as count
-            """
-            dep_counts = [dict(record) for record in session.run(deps_query, repo_id=repo_id)]
+            # Dependency type counts
+            dep_counts = [
+                dict(r)
+                for r in session.run(
+                    """
+                    MATCH (a)-[r]->(b)
+                    WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id)
+                    RETURN type(r) as type, count(*) as count
+                    """,
+                    repo_id=repo_id,
+                )
+            ]
 
-            files_count = session.run(
+            # File count
+            files_count_rec = session.run(
                 "MATCH (f:File) WHERE f.repo_id = $repo_id OR f.job_id = $repo_id RETURN count(f) as count",
                 repo_id=repo_id,
             ).single()
+            file_count = files_count_rec["count"] if files_count_rec else 0
+
+            # Language distribution
+            language_dist = {
+                r["lang"]: r["cnt"]
+                for r in session.run(
+                    """
+                    MATCH (f:File) WHERE f.repo_id = $repo_id OR f.job_id = $repo_id
+                    RETURN coalesce(f.language, 'unknown') as lang, count(*) as cnt
+                    """,
+                    repo_id=repo_id,
+                )
+            }
+
+            # Top 10 files by out-degree
+            top_files_by_degree = [
+                {"path": r["path"], "degree": r["degree"]}
+                for r in session.run(
+                    """
+                    MATCH (f:File)-[r]->()
+                    WHERE f.repo_id = $repo_id OR f.job_id = $repo_id
+                    RETURN coalesce(f.path, f.name) as path, count(r) as degree
+                    ORDER BY degree DESC LIMIT 10
+                    """,
+                    repo_id=repo_id,
+                )
+            ]
+
+            # Total edges for density calculation
+            edge_rec = session.run(
+                "MATCH (a)-[r]->(b) WHERE (a.repo_id = $repo_id OR a.job_id = $repo_id) RETURN count(r) as edges",
+                repo_id=repo_id,
+            ).single()
+            total_edges = edge_rec["edges"] if edge_rec else 0
+            edge_density = round(total_edges / max(file_count, 1), 2)
 
             summary = {
                 "repo_id": repo_id,
-                "file_count": files_count["count"] if files_count else 0,
+                "file_count": file_count,
+                "language_dist": language_dist,
                 "boundaries": boundaries,
                 "dependency_types": dep_counts,
+                "top_files_by_degree": top_files_by_degree,
+                "circular_dep_count": 0,
+                "edge_density": edge_density,
             }
 
-            settings = LLMSettings.from_env()
+            settings = GeminiSettings.from_env()
+
+            # Overall pattern analysis (offloaded to thread pool — non-blocking)
             pattern_prompt = build_pattern_prompt(summary)
-            pattern_resp = parse_json_response(call_llm(pattern_prompt, settings))
+            pattern_text = await asyncio.to_thread(call_gemini, pattern_prompt, settings)
+            pattern_resp = parse_json_response(pattern_text)
 
-            insights = []
-            insights.append(
-                {
-                    "pattern_type": pattern_resp.get("pattern_type", "unknown"),
-                    "confidence": pattern_resp.get("confidence"),
-                    "summary": pattern_resp.get("summary", ""),
-                    "generated_at": datetime.utcnow(),
-                }
-            )
+            generated_at = datetime.utcnow().isoformat()
 
-            for boundary in boundaries:
-                module_name = boundary.get("name") or "unknown"
-                files = boundary.get("files", [])
+            pattern_insight = {
+                "pattern_type": pattern_resp.get("pattern_type", "unknown"),
+                "confidence": pattern_resp.get("confidence"),
+                "summary": pattern_resp.get("summary", ""),
+                "patterns_found": pattern_resp.get("patterns_found", []),
+                "antipatterns": pattern_resp.get("antipatterns", []),
+                "recommendations": pattern_resp.get("recommendations", []),
+            }
 
-                deps = session.run(
+            # Module summaries — use Boundary nodes when available, else top files
+            module_insights: List[Dict] = []
+
+            if boundaries:
+                for boundary in boundaries:
+                    bname = boundary.get("name") or "unknown"
+                    bfiles = boundary.get("files", [])
+
+                    deps_list = [
+                        dict(r)
+                        for r in session.run(
+                            """
+                            MATCH (f:File)-[r]->(t)
+                            WHERE f.path IN $files
+                              AND (f.repo_id = $repo_id OR f.job_id = $repo_id)
+                            RETURN f.path as source, type(r) as relationship,
+                                   labels(t)[0] as target_type,
+                                   coalesce(t.name, t.path) as target
+                            LIMIT 30
+                            """,
+                            repo_id=repo_id,
+                            files=bfiles,
+                        )
+                    ]
+
+                    mprompt = build_module_summary_prompt(bname, bfiles, deps_list)
+                    mtext = await asyncio.to_thread(call_gemini, mprompt, settings)
+                    mresp = parse_json_response(mtext)
+
+                    module_insights.append(
+                        {
+                            "name": bname,
+                            "summary": mresp.get("summary", ""),
+                            "role": mresp.get("role", "unknown"),
+                            "coupling_concern": mresp.get("coupling_concern", "medium"),
+                        }
+                    )
+            else:
+                # Fallback: summarise the 20 most-connected files
+                top_file_rows = [
+                    dict(r)
+                    for r in session.run(
+                        """
+                        MATCH (f:File) WHERE f.repo_id = $repo_id OR f.job_id = $repo_id
+                        OPTIONAL MATCH (f)-[r]->()
+                        WITH f, count(r) as degree
+                        ORDER BY degree DESC LIMIT 20
+                        RETURN coalesce(f.path, f.name) as path,
+                               coalesce(f.language, 'unknown') as language,
+                               coalesce(f.functions, []) as functions,
+                               coalesce(f.classes, []) as classes,
+                               coalesce(f.imports, []) as imports
+                        """,
+                        repo_id=repo_id,
+                    )
+                ]
+
+                # Build a map of dependents (files that import/call each file)
+                dependents_map: Dict[str, List[str]] = {}
+                for r in session.run(
                     """
-                    MATCH (f:File)-[r]->(t)
-                    WHERE f.path IN $files AND (f.repo_id = $repo_id OR f.job_id = $repo_id)
-                    RETURN f.path as source, type(r) as relationship, labels(t)[0] as target_type, coalesce(t.name, t.path) as target
+                    MATCH (a:File)-[:IMPORTS|CALLS]->(f:File)
+                    WHERE f.repo_id = $repo_id OR f.job_id = $repo_id
+                    RETURN coalesce(f.path, f.name) as target,
+                           coalesce(a.path, a.name) as src
                     """,
                     repo_id=repo_id,
-                    files=files,
-                )
-                deps_list = [dict(record) for record in deps]
+                ):
+                    dependents_map.setdefault(r["target"], []).append(r["src"])
 
-                module_prompt = build_module_summary_prompt(module_name, files, deps_list)
-                module_resp = parse_json_response(call_llm(module_prompt, settings))
+                for row in top_file_rows:
+                    fpath = row.get("path", "")
+                    lang = row.get("language", "unknown")
+                    funcs = list(row.get("functions") or [])
+                    classes = list(row.get("classes") or [])
+                    imports_list = list(row.get("imports") or [])
+                    dependents = dependents_map.get(fpath, [])[:10]
 
-                insights.append(
-                    {
-                        "pattern_type": f"module_summary:{module_name}",
-                        "confidence": None,
-                        "summary": module_resp.get("summary", ""),
-                        "generated_at": datetime.utcnow(),
-                    }
-                )
+                    fprompt = build_file_summary_prompt(fpath, lang, funcs, classes, imports_list, dependents)
+                    ftext = await asyncio.to_thread(call_gemini, fprompt, settings)
+                    fresp = parse_json_response(ftext)
 
-            store_insights(repo_id, insights)
+                    module_insights.append(
+                        {
+                            "name": fpath,
+                            "file_path": fpath,
+                            "language": lang,
+                            "summary": fresp.get("summary", ""),
+                            "role": fresp.get("role", "unknown"),
+                            "coupling_concern": fresp.get("coupling_concern", "medium"),
+                        }
+                    )
 
-            return {
+            result = {
                 "cached": False,
                 "repo_id": repo_id,
-                "insights": insights,
+                "generated_at": generated_at,
+                "pattern": pattern_insight,
+                "modules": module_insights,
             }
+
+            store_analysis_result(repo_id, result)
+            return result
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error analyzing architecture: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1626,7 +1772,7 @@ async def analyze_architecture(repo_id: str, refresh: bool = False):
 async def get_architecture_insights(repo_id: str):
     cached = read_cached_insights(repo_id)
     if cached:
-        return {"cached": True, **cached}
+        return cached
 
     raise HTTPException(status_code=404, detail="No cached architecture insights found")
 
