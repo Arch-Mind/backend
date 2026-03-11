@@ -31,8 +31,7 @@ def call_gemini(prompt: str, settings: GeminiSettings) -> str:
     try:
         from google import genai
 
-        os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
-        client = genai.Client()
+        client = genai.Client(api_key=settings.gemini_api_key)
 
         response = client.models.generate_content(
             model=settings.model,
