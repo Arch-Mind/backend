@@ -4,89 +4,78 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"testing"
 	"os"
+	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
 
-// setupTestRouter creates a router with the getGraphFiles route for testing
-func setupTestRouter() *gin.Engine {
+// ===========================================================================
+// Graph Files Proxy Tests – API Gateway → Graph Engine
+// ===========================================================================
+
+func setupGraphFilesRouter() *gin.Engine {
 	gin.SetMode(gin.TestMode)
-	router := gin.Default()
-	router.GET("/api/graph/files", getGraphFiles)
-	return router
+	r := gin.Default()
+	r.GET("/api/graph/files", getGraphFiles)
+	return r
 }
 
-// TestGetGraphFiles tests the API Gateway proxy for /api/graph/files
 func TestGetGraphFiles(t *testing.T) {
-	router := setupTestRouter()
+	router := setupGraphFilesRouter()
 
-	t.Run("Passed - Valid Query", func(t *testing.T) {
-		// Mock the Graph Engine response using httptest.NewServer
-		mockGraphEngine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	t.Run("Valid query proxies to graph engine", func(t *testing.T) {
+		mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			assert.Equal(t, "/api/graph/files", r.URL.Path)
 			assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", r.URL.Query().Get("repo_id"))
-			
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"nodes": []interface{}{},
-				"edges": []interface{}{},
-				"total_nodes": 0,
-				"total_edges": 0,
+				"nodes": []interface{}{}, "edges": []interface{}{},
+				"total_nodes": 0, "total_edges": 0,
 			})
 		}))
-		defer mockGraphEngine.Close()
+		defer mock.Close()
 
-		// Temporarily override GRAPH_ENGINE_URL
-		originalURL := os.Getenv("GRAPH_ENGINE_URL")
-		os.Setenv("GRAPH_ENGINE_URL", mockGraphEngine.URL)
-		defer os.Setenv("GRAPH_ENGINE_URL", originalURL)
+		orig := os.Getenv("GRAPH_ENGINE_URL")
+		os.Setenv("GRAPH_ENGINE_URL", mock.URL)
+		defer os.Setenv("GRAPH_ENGINE_URL", orig)
 
-		// Make the request to the API gateway
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest("GET", "/api/graph/files?repo_id=550e8400-e29b-41d4-a716-446655440000", nil)
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		
-		var response map[string]interface{}
-		err := json.Unmarshal(w.Body.Bytes(), &response)
-		assert.NoError(t, err)
-		assert.Contains(t, response, "nodes")
+		var resp map[string]interface{}
+		assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Contains(t, resp, "nodes")
 	})
 
-	t.Run("Failed - Missing repo_id", func(t *testing.T) {
+	t.Run("Missing repo_id returns 400", func(t *testing.T) {
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest("GET", "/api/graph/files", nil)
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
-		
-		var response map[string]interface{}
-		json.Unmarshal(w.Body.Bytes(), &response)
-		assert.Equal(t, "Missing repo_id query parameter", response["error"])
+		var resp map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.Equal(t, "Missing repo_id query parameter", resp["error"])
 	})
 
-	t.Run("Failed - Graph Engine Error", func(t *testing.T) {
-		// Mock Graph Engine to return an error
-		mockGraphEngine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	t.Run("Graph engine error returns 502", func(t *testing.T) {
+		mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		}))
-		defer mockGraphEngine.Close()
-
-		os.Setenv("GRAPH_ENGINE_URL", mockGraphEngine.URL)
+		defer mock.Close()
+		os.Setenv("GRAPH_ENGINE_URL", mock.URL)
 
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest("GET", "/api/graph/files?repo_id=550e8400-e29b-41d4-a716-446655440000", nil)
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusBadGateway, w.Code)
-		
-		var response map[string]interface{}
-		json.Unmarshal(w.Body.Bytes(), &response)
-		assert.Equal(t, "Graph engine returned an error", response["error"])
+		var resp map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.Equal(t, "Graph engine returned an error", resp["error"])
 	})
 }

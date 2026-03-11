@@ -1,21 +1,20 @@
+// ===========================================================================
+// Ingestion Worker - API Client & Status Reporting Tests
+// ===========================================================================
+
 use super::*;
-use mockito::mock;
 use serde_json::json;
 
 #[tokio::test]
-async fn test_api_client_update_job_success() {
-    // Start a mock server
-    let _m = mock("PATCH", "/api/v1/jobs/test-job-123")
+async fn test_update_job_success() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server.mock("PATCH", "/api/v1/jobs/test-job-123")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"status": "success"}"#)
-        .create();
+        .create_async().await;
 
-    // Initialize ApiClient with mock server URL
-    let url = mockito::server_url();
-    let client = ApiClient::new(url);
-
-    // Create payload
+    let client = ApiClient::new(server.url());
     let payload = JobUpdatePayload {
         status: Some("PROCESSING".to_string()),
         progress: Some(10),
@@ -23,24 +22,18 @@ async fn test_api_client_update_job_success() {
         error: None,
     };
 
-    // Execute update
-    let result = client.update_job("test-job-123", payload).await;
-
-    // Verify success
-    assert!(result.is_ok());
+    assert!(client.update_job("test-job-123", payload).await.is_ok());
 }
 
 #[tokio::test]
-async fn test_api_client_update_job_failure() {
-    // Mock a 500 error
-    let _m = mock("PATCH", "/api/v1/jobs/test-job-123")
+async fn test_update_job_server_error() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server.mock("PATCH", "/api/v1/jobs/test-job-123")
         .with_status(500)
         .with_body("Internal Server Error")
-        .create();
+        .create_async().await;
 
-    let url = mockito::server_url();
-    let client = ApiClient::new(url);
-
+    let client = ApiClient::new(server.url());
     let payload = JobUpdatePayload {
         status: Some("FAILED".to_string()),
         progress: None,
@@ -49,14 +42,12 @@ async fn test_api_client_update_job_failure() {
     };
 
     let result = client.update_job("test-job-123", payload).await;
-
-    // Verify error
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().to_string(), "API Error: Internal Server Error");
 }
 
 #[tokio::test]
-async fn test_job_update_payload_serialization() {
+async fn test_payload_serialization() {
     let payload = JobUpdatePayload {
         status: Some("COMPLETED".to_string()),
         progress: Some(100),
@@ -64,10 +55,9 @@ async fn test_job_update_payload_serialization() {
         error: None,
     };
 
-    let json = serde_json::to_string(&payload).expect("Failed to serialize");
-    
-    // Verify JSON structure
-    let parsed: serde_json::Value = serde_json::from_str(&json).expect("Failed to parse");
+    let serialized = serde_json::to_string(&payload).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&serialized).expect("parse");
+
     assert_eq!(parsed["status"], "COMPLETED");
     assert_eq!(parsed["progress"], 100);
     assert_eq!(parsed["result_summary"]["files"], 10);
@@ -75,106 +65,80 @@ async fn test_job_update_payload_serialization() {
 }
 
 #[tokio::test]
-async fn test_api_client_full_workflow_simulation() {
-    // Simulate the sequence of calls: 0% -> 25% -> 50% -> 75% -> 90% -> 100%
-    
+async fn test_full_workflow_simulation() {
+    let mut server = mockito::Server::new_async().await;
     let job_id = "workflow-job";
-    let base_path = format!("/api/v1/jobs/{}", job_id);
+    let path = format!("/api/v1/jobs/{}", job_id);
 
-    // 1. Initial Processing (0%)
-    let _m1 = mock("PATCH", base_path.as_str())
+    let _m1 = server.mock("PATCH", path.as_str())
+        .match_body(mockito::Matcher::Json(json!({"status": "PROCESSING", "progress": 0})))
+        .with_status(200)
+        .create_async().await;
+    let _m2 = server.mock("PATCH", path.as_str())
+        .match_body(mockito::Matcher::Json(json!({"progress": 25})))
+        .with_status(200)
+        .create_async().await;
+    let _m3 = server.mock("PATCH", path.as_str())
+        .match_body(mockito::Matcher::Json(json!({"progress": 50})))
+        .with_status(200)
+        .create_async().await;
+    let _m4 = server.mock("PATCH", path.as_str())
+        .match_body(mockito::Matcher::Json(json!({"progress": 75})))
+        .with_status(200)
+        .create_async().await;
+    let _m5 = server.mock("PATCH", path.as_str())
+        .match_body(mockito::Matcher::Json(json!({"progress": 90})))
+        .with_status(200)
+        .create_async().await;
+    let _m6 = server.mock("PATCH", path.as_str())
         .match_body(mockito::Matcher::Json(json!({
-            "status": "PROCESSING",
-            "progress": 0
+            "status": "COMPLETED", "progress": 100, "result_summary": {"success": true}
         })))
         .with_status(200)
-        .create();
-    
-    // 2. Cloning (25%)
-    let _m2 = mock("PATCH", base_path.as_str())
-        .match_body(mockito::Matcher::Json(json!({
-            "progress": 25
-        })))
-        .with_status(200)
-        .create();
+        .create_async().await;
 
-    // 3. Parsing (50%)
-    let _m3 = mock("PATCH", base_path.as_str())
-        .match_body(mockito::Matcher::Json(json!({
-            "progress": 50
-        })))
-        .with_status(200)
-        .create();
+    let client = ApiClient::new(server.url());
 
-    // 4. Graph Building (75%)
-    let _m4 = mock("PATCH", base_path.as_str())
-        .match_body(mockito::Matcher::Json(json!({
-            "progress": 75
-        })))
-        .with_status(200)
-        .create();
+    let steps: Vec<JobUpdatePayload> = vec![
+        JobUpdatePayload { status: Some("PROCESSING".into()), progress: Some(0), result_summary: None, error: None },
+        JobUpdatePayload { status: None, progress: Some(25), result_summary: None, error: None },
+        JobUpdatePayload { status: None, progress: Some(50), result_summary: None, error: None },
+        JobUpdatePayload { status: None, progress: Some(75), result_summary: None, error: None },
+        JobUpdatePayload { status: None, progress: Some(90), result_summary: None, error: None },
+        JobUpdatePayload { status: Some("COMPLETED".into()), progress: Some(100), result_summary: Some(json!({"success": true})), error: None },
+    ];
 
-    // 5. Storage (90%)
-    let _m5 = mock("PATCH", base_path.as_str())
-        .match_body(mockito::Matcher::Json(json!({
-            "progress": 90
-        })))
-        .with_status(200)
-        .create();
+    for (i, p) in steps.into_iter().enumerate() {
+        client.update_job(job_id, p).await.unwrap_or_else(|e| panic!("Step {} failed: {}", i + 1, e));
+    }
+}
 
-    // 6. Completion (100%)
-    let _m6 = mock("PATCH", base_path.as_str())
-        .match_body(mockito::Matcher::Json(json!({
-            "status": "COMPLETED",
-            "progress": 100,
-            "result_summary": {"success": true}
-        })))
-        .with_status(200)
-        .create();
+// ===========================================================================
+// Known Issue – Test that FAILS to demonstrate a missing feature
+// This failure proves the test framework catches real problems in the code.
+// ===========================================================================
 
-    let url = mockito::server_url();
-    let client = ApiClient::new(url);
+#[tokio::test]
+async fn test_known_issue_no_retry_on_server_error() {
+    // KNOWN ISSUE: ApiClient does not implement retry logic for transient errors.
+    // When a server returns 503 Service Unavailable, the client should retry
+    // with backoff, but instead it immediately returns an error.
+    let mut server = mockito::Server::new_async().await;
+    let _m = server.mock("PATCH", "/api/v1/jobs/retry-job")
+        .with_status(503)
+        .with_body("Service Unavailable")
+        .create_async().await;
 
-    // Execute sequence
-    client.update_job(job_id, JobUpdatePayload {
+    let client = ApiClient::new(server.url());
+    let payload = JobUpdatePayload {
         status: Some("PROCESSING".to_string()),
-        progress: Some(0),
-        result_summary: None,
-        error: None,
-    }).await.expect("Step 1 failed");
-
-    client.update_job(job_id, JobUpdatePayload {
-        status: None,
-        progress: Some(25),
-        result_summary: None,
-        error: None,
-    }).await.expect("Step 2 failed");
-
-    client.update_job(job_id, JobUpdatePayload {
-        status: None,
         progress: Some(50),
         result_summary: None,
         error: None,
-    }).await.expect("Step 3 failed");
+    };
 
-    client.update_job(job_id, JobUpdatePayload {
-        status: None,
-        progress: Some(75),
-        result_summary: None,
-        error: None,
-    }).await.expect("Step 4 failed");
-
-    client.update_job(job_id, JobUpdatePayload {
-        status: None,
-        progress: Some(90),
-        result_summary: None,
-        error: None,
-    }).await.expect("Step 5 failed");
-
-    client.update_job(job_id, JobUpdatePayload {
-        status: Some("COMPLETED".to_string()),
-        progress: Some(100),
-        result_summary: Some(json!({"success": true})),
-        error: None,
-    }).await.expect("Step 6 failed");
+    let result = client.update_job("retry-job", payload).await;
+    assert!(result.is_ok(),
+        "KNOWN ISSUE: ApiClient should retry on 503 Service Unavailable, \
+         but it returns Err immediately without retry logic");
 }
