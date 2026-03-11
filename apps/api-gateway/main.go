@@ -747,6 +747,10 @@ func setupRouter() *gin.Engine {
 	// Alias exact path for Reverse Analysis Impact
 	router.GET("/api/analyze/impact", analyzeImpact)
 
+	// Architecture insights - proxy to graph engine
+	router.GET("/api/analyze/:repo_id/architecture", getArchitectureInsights)
+	router.POST("/api/analyze/:repo_id/architecture", triggerArchitectureAnalysis)
+
 	// Graph endpoints
 	router.GET("/api/graph/files", getGraphFiles)
 	router.GET("/api/graph/functions/:id/flow", getFunctionFlow)
@@ -1150,6 +1154,52 @@ func analyzeImpact(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+// getArchitectureInsights proxies GET /api/analyze/:repo_id/architecture to the graph engine
+func getArchitectureInsights(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	graphEngineURL := getEnv("GRAPH_ENGINE_URL", "http://graph-engine:8000")
+	requestURL := fmt.Sprintf("%s/api/analyze/%s/architecture", graphEngineURL, url.PathEscape(repoID))
+
+	resp, err := http.Get(requestURL)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Graph engine unavailable"})
+		return
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode graph engine response"})
+		return
+	}
+	c.JSON(resp.StatusCode, result)
+}
+
+// triggerArchitectureAnalysis proxies POST /api/analyze/:repo_id/architecture to the graph engine
+func triggerArchitectureAnalysis(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	refresh := c.Query("refresh")
+	graphEngineURL := getEnv("GRAPH_ENGINE_URL", "http://graph-engine:8000")
+	requestURL := fmt.Sprintf("%s/api/analyze/%s/architecture", graphEngineURL, url.PathEscape(repoID))
+	if refresh != "" {
+		requestURL += "?refresh=" + url.QueryEscape(refresh)
+	}
+
+	resp, err := http.Post(requestURL, "application/json", nil)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Graph engine unavailable"})
+		return
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode graph engine response"})
+		return
+	}
+	c.JSON(resp.StatusCode, result)
 }
 
 // getGraphFiles forwards the request to the graph engine to get the file dependency graph
